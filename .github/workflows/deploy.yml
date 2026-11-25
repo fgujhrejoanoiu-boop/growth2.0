@@ -62,7 +62,7 @@ jobs:
 
       - name: Login to Amazon ECR
         id: login-ecr-prod
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
 
       - name: Extract static assets from Docker image and upload to S3
         env:
@@ -84,7 +84,7 @@ jobs:
       # blocking retry. Silently skipping would cost source maps and commits.
       - name: Create Sentry api release
         id: sentry_api
-        uses: getsentry/action-release@e6703d0b00208e0b3687ba660d18ab5af7892821 # v3.7.2
+        uses: getsentry/action-release@2e505a70ff06dac263413242aa3617fec90134e5 # v3.9.1
         continue-on-error: true
         with:
           environment: "production"
@@ -98,7 +98,7 @@ jobs:
 
       - name: Retry Sentry api release
         if: steps.sentry_api.outcome == 'failure'
-        uses: getsentry/action-release@e6703d0b00208e0b3687ba660d18ab5af7892821 # v3.7.2
+        uses: getsentry/action-release@2e505a70ff06dac263413242aa3617fec90134e5 # v3.9.1
         with:
           environment: "production"
           sourcemaps: "./back-end-dist"
@@ -111,7 +111,7 @@ jobs:
 
       - name: Create Sentry app release
         id: sentry_app
-        uses: getsentry/action-release@e6703d0b00208e0b3687ba660d18ab5af7892821 # v3.7.2
+        uses: getsentry/action-release@2e505a70ff06dac263413242aa3617fec90134e5 # v3.9.1
         continue-on-error: true
         with:
           environment: "production"
@@ -126,7 +126,7 @@ jobs:
 
       - name: Retry Sentry app release
         if: steps.sentry_app.outcome == 'failure'
-        uses: getsentry/action-release@e6703d0b00208e0b3687ba660d18ab5af7892821 # v3.7.2
+        uses: getsentry/action-release@2e505a70ff06dac263413242aa3617fec90134e5 # v3.9.1
         with:
           environment: "production"
           sourcemaps: "./front-end-dist"
@@ -164,7 +164,7 @@ jobs:
 
       - name: Login to Amazon ECR
         id: login-ecr-prod
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
 
       - name: Render task definition
         id: taskdef

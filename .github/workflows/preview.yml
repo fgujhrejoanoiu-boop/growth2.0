@@ -72,7 +72,7 @@ jobs:
       # Fly's remote builder can't authenticate to the private dhi.io base image,
       # so we build on CI via Depot (which can) and deploy the prebuilt image.
       - name: Login to Docker Hardened Images
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: dhi.io
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -96,7 +96,7 @@ jobs:
             flyctl apps list | grep -qw "${{ env.APP_NAME }}"
 
       - name: Build and push preview image
-        uses: depot/build-push-action@98e78adca7817480b8185f474a400b451d74e287 # v1.18.0
+        uses: depot/build-push-action@0f27be7c41d76663a98518dfe68f1c46582242c4 # v1.19.0
         with:
           push: true
           context: .
