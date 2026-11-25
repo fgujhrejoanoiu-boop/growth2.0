@@ -1,0 +1,45 @@
+services:
+  mongo:
+    image: mongo:7.0.32
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: password
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--host",
+          "mongo",
+          "--quiet",
+          "--eval",
+          "db.adminCommand('ping').ok",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - mongodata:/data/db
+  growthbook:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    depends_on:
+      mongo:
+        condition: service_healthy
+    env_file: .env.local
+    environment:
+      MONGODB_URI: ${MONGODB_URI:-mongodb://root:password@mongo:27017/growthbook?authSource=admin}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env.local}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env.local}
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:3000}
+      API_HOST: ${API_HOST:-http://localhost:3100}
+      DISABLE_TELEMETRY: ${DISABLE_TELEMETRY:-true}
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - uploads:/usr/local/src/app/packages/back-end/uploads
+volumes:
+  mongodata:
+  uploads:

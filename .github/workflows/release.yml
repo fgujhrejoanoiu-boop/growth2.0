@@ -1,0 +1,24 @@
+name: Release
+
+on:
+  # Make a new tagged release
+  push:
+    tags:
+      - "v*"
+
+# Read-only by default; a job that needs more asks for it.
+permissions:
+  contents: read
+
+jobs:
+  # Build the tagged commit itself, so the version tag never picks up later commits from :latest
+  docker:
+    if: ${{ github.repository == 'growthbook/growthbook' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/build-image.yml
+    with:
+      ref: ${{ github.sha }}
+      release: ${{ github.ref_name }}
+    secrets: inherit

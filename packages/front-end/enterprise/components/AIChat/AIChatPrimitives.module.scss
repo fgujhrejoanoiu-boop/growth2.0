@@ -1,0 +1,274 @@
+// Keyframes + pseudo-classes that cannot live in inline styles.
+
+@keyframes gb-ai-chat-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes gb-ai-sidebar-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.spinIcon {
+  animation: gb-ai-chat-spin 0.8s linear infinite;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.streamingDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-12);
+  animation: gb-ai-sidebar-pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.streamingMarkdown {
+  display: inline;
+
+  > p:last-child {
+    display: inline;
+  }
+}
+
+.inlineLinkLoading {
+  margin-inline-start: 5px;
+  vertical-align: -1px;
+}
+
+.bubble {
+  overflow-wrap: anywhere;
+
+  * {
+    overflow-wrap: anywhere !important;
+  }
+}
+
+.suggestedPrompt {
+  width: 100%;
+  height: auto;
+  min-height: 48px;
+  justify-content: flex-start;
+  padding: 8px 10px;
+  border-radius: var(--radius-3);
+  color: var(--color-text-high);
+  column-gap: 12px;
+  white-space: normal;
+  text-align: left;
+}
+
+.deleteButton {
+  &:hover svg {
+    color: var(--red-11);
+    transition: color 120ms ease;
+  }
+
+  svg {
+    transition: color 120ms ease;
+  }
+}
+
+// Interactive state concerns for list items.
+// Static layout lives in inline styles on the component.
+.conversationItem {
+  background: none;
+  color: var(--gray-12);
+
+  .conversationDeleteBtn {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 100ms ease;
+  }
+
+  &:hover {
+    background: var(--gray-a3);
+
+    .conversationDeleteBtn {
+      opacity: 1;
+      pointer-events: auto;
+    }
+  }
+
+  &.conversationItemActive {
+    background: var(--violet-10);
+    color: #fff;
+
+    &:hover {
+      background: var(--violet-10);
+    }
+  }
+}
+
+.searchResultItem {
+  background: transparent;
+  color: var(--gray-12);
+
+  &:hover {
+    background: var(--gray-a3);
+  }
+}
+
+.feedbackButton {
+  color: var(--gray-a9);
+  transition: color 120ms ease;
+
+  &:hover {
+    color: var(--gray-12);
+  }
+
+  &.feedbackPositive {
+    color: var(--green-11);
+  }
+
+  &.feedbackNegative {
+    color: var(--red-11);
+  }
+}
+
+@keyframes gb-ai-status-in {
+  0% {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes gb-ai-collapse-out {
+  from {
+    grid-template-rows: minmax(0, 1fr);
+    margin-bottom: 0;
+  }
+  to {
+    grid-template-rows: minmax(0, 0fr);
+    margin-bottom: calc(-1 * var(--space-3));
+  }
+}
+
+@keyframes gb-ai-slide-up {
+  0% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+}
+
+.activeTurnItemWrapper {
+  display: flex;
+  flex-direction: column;
+}
+
+.collapsingItem {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+  animation: gb-ai-collapse-out 1200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  will-change: grid-template-rows, margin-bottom;
+  pointer-events: none;
+
+  > * {
+    min-height: 0;
+    overflow: hidden;
+    animation: gb-ai-slide-up 1200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+    will-change: opacity, transform;
+  }
+}
+
+.agentActivity {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 22px;
+}
+
+.activityCaret {
+  display: inline-flex;
+  flex-shrink: 0;
+  transition: transform 160ms ease;
+}
+
+.activityViewLabel {
+  color: var(--gray-a9);
+  font-size: var(--font-size-1);
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.collapsedToggle:hover .activityViewLabel,
+.collapsedToggle:focus-visible .activityViewLabel {
+  opacity: 1;
+}
+
+.activeStatus {
+  min-height: 20px;
+}
+
+.statusText {
+  display: inline-flex;
+  min-width: 0;
+  animation: gb-ai-status-in 180ms ease-out;
+}
+
+.userBubble {
+  color: white;
+
+  span {
+    color: inherit !important;
+  }
+
+  ::selection {
+    background: rgba(255, 255, 255, 0.35);
+    color: #fff;
+  }
+}
+
+.collapsedToggle {
+  &:hover {
+    color: var(--gray-12);
+  }
+}
+
+.collapsedContent {
+  pre {
+    background: var(--gray-a3) !important;
+    width: fit-content;
+    max-width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinIcon,
+  .streamingDot,
+  .statusText,
+  .collapsingItem {
+    animation: none;
+  }
+
+  .collapsingItem > * {
+    animation: none;
+  }
+
+  .activityCaret {
+    transition: none;
+  }
+
+  .collapsingItem {
+    display: none;
+  }
+}

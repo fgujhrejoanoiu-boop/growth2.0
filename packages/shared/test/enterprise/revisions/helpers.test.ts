@@ -1,0 +1,1697 @@
+import type {
+  ApprovalFlowConfigurations,
+  OrganizationSettings,
+} from "../../../types/organization";
+import type { TeamInterface } from "../../../types/team";
+import {
+  getRevisionKey,
+  canUserReviewEntity,
+  checkMergeConflicts,
+  getRevisionUpdatableFields,
+  normalizeProposedChanges,
+  applyTopLevelPatchOps,
+  patchOpsToPartial,
+  getApprovalFlowSettings,
+  isAutopublishOnApprovalEnabled,
+  isSavedGroupRevisionMetadataOnly,
+  isSavedGroupRevisionArchiveOnly,
+  isConstantRevisionMetadataOnly,
+  isSdkConnectionRevisionMetadataOnly,
+  isSdkConnectionRevisionReviewExempt,
+  getSdkConnectionGoverningRules,
+  getSdkConnectionReviewRules,
+  isUserBlockedFromApproving,
+  mergeNestedBranch,
+  landedOps,
+  reviewCoverageProjects,
+  sdkConnectionDraftSettingsAfterSave,
+} from "../../../src/revisions/helpers";
+import { entityPublishFootprint } from "../../../src/revisions/entityPublishFootprint";
+import type {
+  RevisionTargetType,
+  Revision,
+  JsonPatchOperation,
+} from "../../../src/validators/revisions";
+
+// Helper to create a mock revision
+const createRevision = (overrides: Partial<Revision> = {}): Revision =>
+  ({
+    id: "rev-1",
+    target: {
+      type: "saved-group" as const,
+      id: "sg-1",
+      snapshot: {} as Record<string, unknown>,
+      proposedChanges: [] as JsonPatchOperation[],
+    },
+    status: "pending-review",
+    authorId: "author-1",
+    reviews: [],
+    activityLog: [],
+    dateCreated: new Date(),
+    dateUpdated: new Date(),
+    organization: "org-1",
+    ...overrides,
+  }) as Revision;
+
+describe("revisions helpers", () => {
+  describe("getRevisionKey", () => {
+    it("maps saved-group to saved-groups", () => {
+      expect(getRevisionKey("saved-group")).toBe("saved-groups");
+    });
+    it("returns null for unsupported type", () => {
+      expect(getRevisionKey("unknown" as RevisionTargetType)).toBeNull();
+    });
+  });
+
+  describe("canUserReviewEntity - saved-group", () => {
+    const baseRevision = createRevision({
+      authorId: "user-author",
+    });
+
+    it("returns true when user can edit and is not the author", () => {
+      expect(
+        canUserReviewEntity({
+          entityType: "saved-group",
+          revision: baseRevision,
+          entity: {},
+          approvalFlowSettings: { savedGroups: [{ required: true }] },
+          userId: "user-reviewer",
+          canEditEntity: true,
+        }),
+      ).toBe(true);
+    });
+
+    it("returns false when user is the author", () => {
+      expect(
+        canUserReviewEntity({
+          entityType: "saved-group",
+          revision: baseRevision,
+          entity: {},
+          approvalFlowSettings: { savedGroups: [{ required: true }] },
+          userId: "user-author",
+          canEditEntity: true,
+        }),
+      ).toBe(false);
+    });
+
+    it("returns false when user cannot edit", () => {
+      expect(
+        canUserReviewEntity({
+          entityType: "saved-group",
+          revision: baseRevision,
+          entity: {},
+          approvalFlowSettings: { savedGroups: [{ required: true }] },
+          userId: "user-reviewer",
+          canEditEntity: false,
+        }),
+      ).toBe(false);
+    });
+
+    it("returns false when revision is already merged", () => {
+      const mergedFlow = createRevision({
+        authorId: "user-author",
+        status: "merged",
+      });
+      expect(
+        canUserReviewEntity({
+          entityType: "saved-group",
+          revision: mergedFlow,
+          entity: {},
+          approvalFlowSettings: { savedGroups: [{ required: true }] },
+          userId: "user-reviewer",
+          canEditEntity: true,
+        }),
+      ).toBe(false);
+    });
+
+    it("returns false when revision is discarded", () => {
+      const discardedFlow = createRevision({
+        authorId: "user-author",
+        status: "discarded",
+      });
+      expect(
+        canUserReviewEntity({
+          entityType: "saved-group",
+          revision: discardedFlow,
+          entity: {},
+          approvalFlowSettings: { savedGroups: [{ required: true }] },
+          userId: "user-reviewer",
+          canEditEntity: true,
+        }),
+      ).toBe(false);
+    });
+
+    it("returns true when approvalFlowSettings is undefined", () => {
+      expect(
+        canUserReviewEntity({
+          entityType: "saved-group",
+          revision: baseRevision,
+          entity: {},
+          approvalFlowSettings:
+            undefined as unknown as ApprovalFlowConfigurations,
+          userId: "user-reviewer",
+          canEditEntity: true,
+        }),
+      ).toBe(true);
+    });
+  });
+
+  describe("getRevisionUpdatableFields", () => {
+    it("excludes config scopedOverrides (the field that caused phantom conflicts)", () => {
+      const fields = getRevisionUpdatableFields("config");
+      expect(fields.has("value")).toBe(true);
+      expect(fields.has("schema")).toBe(true);
+      // Excluded from configUpdatableFieldsSchema -> must not gate conflicts.
+      expect(fields.has("scopedOverrides")).toBe(false);
+      // Non-updatable identity/metadata fields are also excluded.
+      expect(fields.has("id")).toBe(false);
+      expect(fields.has("key")).toBe(false);
+    });
+
+    it("returns the constant updatable fields", () => {
+      const fields = getRevisionUpdatableFields("constant");
+      expect(fields.has("value")).toBe(true);
+      expect(fields.has("environmentValues")).toBe(true);
+      expect(fields.has("id")).toBe(false);
+    });
+
+    it("returns a non-empty set for saved-group", () => {
+      expect(getRevisionUpdatableFields("saved-group").size).toBeGreaterThan(0);
+    });
+  });
+
+  describe("checkMergeConflicts", () => {
+    it("returns success when there are no conflicts", () => {
+      const base = { name: "old", value: 1 };
+      const live = { name: "old", value: 1 };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "new" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(true);
+      expect(result.conflicts).toHaveLength(0);
+      expect(result.canAutoMerge).toBe(true);
+      expect(result.mergedChanges).toEqual({ name: "new", value: 1 });
+    });
+
+    it("detects conflicts when base, live, and proposed all differ", () => {
+      const base = { name: "old" };
+      const live = { name: "live-change" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "proposed-change" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(false);
+      expect(result.conflicts).toHaveLength(1);
+      expect(result.conflicts[0].field).toBe("name");
+      expect(result.canAutoMerge).toBe(false);
+    });
+
+    it("ignores ops for fields outside the updatable allowlist", () => {
+      // A field the merge can't write can't truly conflict. Mirrors the config
+      // `scopedOverrides` shape: excluded from the snapshot (so base reads
+      // undefined) and not revision-updatable, yet a draft's proposedChanges can
+      // still carry an op for it — which without the allowlist renders a phantom
+      // `undefined -> [...]` conflict on every rebase.
+      const base = {}; // snapshot excludes scopedOverrides -> undefined
+      const live = { scopedOverrides: [{ config: "flavor_dev_live" }] };
+      const proposed: JsonPatchOperation[] = [
+        {
+          op: "replace",
+          path: "/scopedOverrides",
+          value: [{ config: "flavor_dev_draft" }],
+        },
+      ];
+      // No allowlist -> every field considered (back-compat): phantom conflict.
+      expect(checkMergeConflicts(base, live, proposed).success).toBe(false);
+      // With the allowlist (scopedOverrides not updatable) -> no conflict.
+      const result = checkMergeConflicts(
+        base,
+        live,
+        proposed,
+        new Set(["value", "name"]),
+      );
+      expect(result.success).toBe(true);
+      expect(result.conflicts).toHaveLength(0);
+    });
+
+    it("still detects a conflict on an allowlisted field", () => {
+      const base = { value: "old" };
+      const live = { value: "live-change" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/value", value: "proposed-change" },
+      ];
+      const result = checkMergeConflicts(
+        base,
+        live,
+        proposed,
+        new Set(["value"]),
+      );
+      expect(result.success).toBe(false);
+      expect(result.conflicts[0].field).toBe("value");
+    });
+
+    it("surfaces only allowlisted fields when ops are mixed", () => {
+      const base = { value: "old" };
+      const live = { value: "live", scopedOverrides: [{ config: "a" }] };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/value", value: "draft" },
+        { op: "replace", path: "/scopedOverrides", value: [{ config: "b" }] },
+      ];
+      const result = checkMergeConflicts(
+        base,
+        live,
+        proposed,
+        new Set(["value"]),
+      );
+      // The non-updatable scopedOverrides op is dropped; only value conflicts.
+      expect(result.conflicts).toHaveLength(1);
+      expect(result.conflicts[0].field).toBe("value");
+    });
+
+    it("ignores a remove op for a non-updatable field", () => {
+      const base = { scopedOverrides: [{ config: "a" }] };
+      const live = { scopedOverrides: [{ config: "b" }] };
+      const proposed: JsonPatchOperation[] = [
+        { op: "remove", path: "/scopedOverrides" },
+      ];
+      const result = checkMergeConflicts(
+        base,
+        live,
+        proposed,
+        new Set(["value"]),
+      );
+      expect(result.success).toBe(true);
+      expect(result.fieldsChanged).not.toContain("scopedOverrides");
+    });
+
+    it("no conflict when live and proposed changed to the same value", () => {
+      const base = { name: "old" };
+      const live = { name: "same-new" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "same-new" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(true);
+      expect(result.conflicts).toHaveLength(0);
+    });
+
+    it("merges non-overlapping changes", () => {
+      const base = { name: "old", color: "red" };
+      const live = { name: "old", color: "blue" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "new" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(true);
+      expect(result.mergedChanges).toEqual({ name: "new", color: "blue" });
+    });
+
+    it("handles array values", () => {
+      const base = { values: ["a", "b"] };
+      const live = { values: ["a", "b", "c"] };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/values", value: ["a", "d"] },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(false);
+      expect(result.conflicts[0].field).toBe("values");
+    });
+
+    it("returns no conflict when proposed matches base (no real change)", () => {
+      const base = { name: "same" };
+      const live = { name: "same" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "same" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(true);
+      expect(result.fieldsChanged).toHaveLength(0);
+    });
+
+    it("treats add ops the same as replace ops", () => {
+      const base = { name: "old" };
+      const live = { name: "old" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "add", path: "/description", value: "new desc" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(true);
+      expect(result.fieldsChanged).toEqual(["description"]);
+      expect(result.mergedChanges).toEqual({
+        name: "old",
+        description: "new desc",
+      });
+    });
+
+    it("treats remove ops as setting field to undefined", () => {
+      const base = { name: "old", description: "to-remove" };
+      const live = { name: "old", description: "to-remove" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "remove", path: "/description" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      // remove sets the proposed value to undefined; hasChanged sees val1==null and bails,
+      // so it ends up as "no change" (a quirky but documented behaviour)
+      expect(result.success).toBe(true);
+    });
+
+    it("uses last-write-wins when multiple ops target the same field", () => {
+      const base = { name: "old" };
+      const live = { name: "old" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "first" },
+        { op: "replace", path: "/name", value: "winner" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(true);
+      expect(result.mergedChanges).toEqual({ name: "winner" });
+    });
+
+    it("collects multiple conflicts across multiple fields", () => {
+      const base = { name: "n0", color: "c0" };
+      const live = { name: "n-live", color: "c-live" };
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "n-prop" },
+        { op: "replace", path: "/color", value: "c-prop" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(false);
+      expect(result.conflicts.map((c) => c.field).sort()).toEqual([
+        "color",
+        "name",
+      ]);
+      expect(result.canAutoMerge).toBe(false);
+      expect(result.mergedChanges).toBeUndefined();
+    });
+
+    it("ignores nested paths when grouping by top-level field", () => {
+      const base = { values: ["a", "b"] };
+      const live = { values: ["a", "b"] };
+      // Nested path /values/0 — top-level field is still "values"
+      const proposed: JsonPatchOperation[] = [
+        { op: "replace", path: "/values/0", value: "z" },
+      ];
+      const result = checkMergeConflicts(base, live, proposed);
+      // proposedValue for "values" becomes "z" (not the array), differs from base — counted as change
+      expect(result.fieldsChanged).toContain("values");
+    });
+
+    it("ignores legacy plain-object proposedChanges (treats as empty)", () => {
+      const base = { name: "old" };
+      const live = { name: "live" };
+      // Legacy DB documents stored a plain object instead of an array.
+      // checkMergeConflicts uses normalizeProposedChanges → empty.
+      const proposed = { name: "new" } as unknown as JsonPatchOperation[];
+      const result = checkMergeConflicts(base, live, proposed);
+      expect(result.success).toBe(true);
+      expect(result.fieldsChanged).toHaveLength(0);
+      expect(result.mergedChanges).toEqual(live);
+    });
+  });
+
+  describe("normalizeProposedChanges", () => {
+    it("returns the array unchanged when given an array", () => {
+      const ops: JsonPatchOperation[] = [
+        { op: "replace", path: "/a", value: 1 },
+      ];
+      expect(normalizeProposedChanges(ops)).toBe(ops);
+    });
+
+    it("returns an empty array for null/undefined", () => {
+      expect(normalizeProposedChanges(null)).toEqual([]);
+      expect(normalizeProposedChanges(undefined)).toEqual([]);
+    });
+
+    it("returns an empty array for plain-object legacy values", () => {
+      expect(normalizeProposedChanges({ name: "x" })).toEqual([]);
+    });
+
+    it("returns an empty array for primitives", () => {
+      expect(normalizeProposedChanges("string")).toEqual([]);
+      expect(normalizeProposedChanges(123)).toEqual([]);
+    });
+  });
+
+  describe("applyTopLevelPatchOps", () => {
+    it("returns the snapshot unchanged when no ops", () => {
+      const snap = { a: 1, b: 2 };
+      expect(applyTopLevelPatchOps(snap, [])).toBe(snap);
+    });
+
+    it("applies replace and add ops", () => {
+      const snap = { a: 1, b: 2 };
+      const result = applyTopLevelPatchOps(snap, [
+        { op: "replace", path: "/a", value: 99 },
+        { op: "add", path: "/c", value: 3 },
+      ]);
+      expect(result).toEqual({ a: 99, b: 2, c: 3 });
+    });
+
+    it("applies remove ops", () => {
+      const snap = { a: 1, b: 2 };
+      const result = applyTopLevelPatchOps(snap, [
+        { op: "remove", path: "/b" },
+      ]);
+      expect(result).toEqual({ a: 1 });
+    });
+
+    it("does not mutate the original snapshot", () => {
+      const snap = { a: 1 };
+      applyTopLevelPatchOps(snap, [{ op: "replace", path: "/a", value: 2 }]);
+      expect(snap).toEqual({ a: 1 });
+    });
+
+    it("ignores nested paths", () => {
+      const snap = { values: ["a", "b"] };
+      const result = applyTopLevelPatchOps(snap, [
+        { op: "replace", path: "/values/0", value: "z" },
+      ]);
+      expect(result).toEqual({ values: ["a", "b"] });
+    });
+
+    it("ignores ops with empty top-level field", () => {
+      const snap = { a: 1 };
+      const result = applyTopLevelPatchOps(snap, [
+        { op: "replace", path: "/", value: "x" },
+      ]);
+      expect(result).toEqual({ a: 1 });
+    });
+
+    it("returns snapshot unchanged for legacy plain-object input", () => {
+      const snap = { a: 1 };
+      const result = applyTopLevelPatchOps(snap, {
+        a: 99,
+      } as unknown as JsonPatchOperation[]);
+      expect(result).toBe(snap);
+    });
+  });
+
+  describe("patchOpsToPartial", () => {
+    it("converts replace and add ops to a partial object", () => {
+      const ops: JsonPatchOperation[] = [
+        { op: "replace", path: "/name", value: "x" },
+        { op: "add", path: "/desc", value: "d" },
+      ];
+      expect(patchOpsToPartial(ops)).toEqual({ name: "x", desc: "d" });
+    });
+
+    it("converts remove ops to undefined fields", () => {
+      const ops: JsonPatchOperation[] = [{ op: "remove", path: "/name" }];
+      expect(patchOpsToPartial(ops)).toEqual({ name: undefined });
+    });
+
+    it("returns the legacy plain object unchanged", () => {
+      const legacy = { name: "x", desc: "d" };
+      expect(patchOpsToPartial(legacy as unknown as JsonPatchOperation[])).toBe(
+        legacy,
+      );
+    });
+
+    it("ignores nested paths", () => {
+      const ops: JsonPatchOperation[] = [
+        { op: "replace", path: "/values/0", value: "z" },
+      ];
+      expect(patchOpsToPartial(ops)).toEqual({});
+    });
+
+    it("returns empty object for null/undefined and arrays", () => {
+      // null is also an "object" in JS — function should treat it as empty
+      expect(
+        patchOpsToPartial(null as unknown as JsonPatchOperation[]),
+      ).toEqual({});
+      expect(patchOpsToPartial([])).toEqual({});
+    });
+  });
+
+  describe("canUserReviewEntity - non-saved-group entity types", () => {
+    // We simulate a hypothetical future entity type to exercise the
+    // managedBy team/admin code paths. Cast to the union as needed.
+    const otherType = "feature" as unknown as RevisionTargetType;
+
+    const teamMember: TeamInterface = {
+      id: "team-1",
+      organization: "org-1",
+      createdBy: "creator-1",
+      name: "Team A",
+      members: ["user-reviewer"],
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+      description: "",
+      role: "engineer",
+      limitAccessByEnvironment: false,
+      environments: [],
+      projectRoles: [],
+      managedByIdp: false,
+    };
+
+    it("managedBy=team: allows team member reviewer", () => {
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision: createRevision({ authorId: "author-1" }),
+        entity: { managedBy: "team", ownerTeam: "team-1" },
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+        teams: [teamMember],
+      });
+      expect(result).toBe(true);
+    });
+
+    it("managedBy=team: rejects non-team-member reviewer", () => {
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision: createRevision({ authorId: "author-1" }),
+        entity: { managedBy: "team", ownerTeam: "team-1" },
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "stranger",
+        teams: [teamMember],
+      });
+      expect(result).toBe(false);
+    });
+
+    it("managedBy=team: rejects when no ownerTeam set", () => {
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision: createRevision({ authorId: "author-1" }),
+        entity: { managedBy: "team" },
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+        teams: [teamMember],
+      });
+      expect(result).toBe(false);
+    });
+
+    it("managedBy=admin: allows reviewer with manageOfficialResources permission", () => {
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision: createRevision({ authorId: "author-1" }),
+        entity: { managedBy: "admin" },
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+        userPermissions: { manageOfficialResources: true },
+      });
+      expect(result).toBe(true);
+    });
+
+    it("managedBy=admin: rejects reviewer without manageOfficialResources", () => {
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision: createRevision({ authorId: "author-1" }),
+        entity: { managedBy: "admin" },
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+        userPermissions: { manageOfficialResources: false },
+      });
+      expect(result).toBe(false);
+    });
+
+    it("managedBy=admin: still rejects the author even if they have permission", () => {
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision: createRevision({ authorId: "user-reviewer" }),
+        entity: { managedBy: "admin" },
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+        userPermissions: { manageOfficialResources: true },
+      });
+      expect(result).toBe(false);
+    });
+
+    it("returns false when managedBy is unset", () => {
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision: createRevision({ authorId: "author-1" }),
+        entity: {},
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+      });
+      expect(result).toBe(false);
+    });
+
+    it("uses the latest proposed managedBy value when resolving review eligibility", () => {
+      const revision = createRevision({
+        authorId: "author-1",
+        target: {
+          type: "saved-group" as const,
+          id: "sg-1",
+          snapshot: {} as Record<string, unknown>,
+          proposedChanges: [
+            { op: "replace", path: "/managedBy", value: "admin" },
+          ] as JsonPatchOperation[],
+        } as Revision["target"],
+      });
+      // Live entity says team — but the revision proposes "admin",
+      // so the admin path should be used.
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision,
+        entity: { managedBy: "team", ownerTeam: "team-1" },
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+        userPermissions: { manageOfficialResources: true },
+      });
+      expect(result).toBe(true);
+    });
+
+    it("uses the latest proposed ownerTeam value when resolving review eligibility", () => {
+      const revision = createRevision({
+        authorId: "author-1",
+        target: {
+          type: "saved-group" as const,
+          id: "sg-1",
+          snapshot: {} as Record<string, unknown>,
+          proposedChanges: [
+            { op: "replace", path: "/ownerTeam", value: "team-1" },
+          ] as JsonPatchOperation[],
+        } as Revision["target"],
+      });
+      const result = canUserReviewEntity({
+        entityType: otherType,
+        revision,
+        entity: { managedBy: "team" }, // no ownerTeam on live entity
+        approvalFlowSettings: {} as ApprovalFlowConfigurations,
+        userId: "user-reviewer",
+        teams: [teamMember],
+      });
+      expect(result).toBe(true);
+    });
+  });
+
+  describe("getApprovalFlowSettings", () => {
+    it("returns undefined when approvalFlows is undefined", () => {
+      expect(getApprovalFlowSettings(undefined, "saved-group")).toBeUndefined();
+    });
+
+    it("returns the first savedGroups config for saved-group entityType", () => {
+      const cfg = {
+        savedGroups: [
+          {
+            required: true,
+            requireMetadataReview: false,
+            blockSelfApproval: true,
+          },
+        ],
+      } as ApprovalFlowConfigurations;
+      expect(getApprovalFlowSettings(cfg, "saved-group")).toEqual(
+        cfg.savedGroups[0],
+      );
+    });
+
+    it("returns undefined for unknown entityType", () => {
+      const cfg = {
+        savedGroups: [{ required: true, requireMetadataReview: false }],
+      } as ApprovalFlowConfigurations;
+      expect(
+        getApprovalFlowSettings(cfg, "unknown" as RevisionTargetType),
+      ).toBeUndefined();
+    });
+  });
+
+  describe("isUserBlockedFromApproving", () => {
+    const sgSettings = (blockSelfApproval: boolean) =>
+      ({
+        approvalFlows: {
+          savedGroups: [
+            { required: true, requireMetadataReview: false, blockSelfApproval },
+          ],
+        },
+      }) as OrganizationSettings;
+
+    const baseRevision = createRevision({
+      authorId: "author-1",
+      contributors: ["author-1", "user-2"],
+    });
+
+    it("returns false when blockSelfApproval is not enabled", () => {
+      expect(
+        isUserBlockedFromApproving({
+          settings: sgSettings(false),
+          entityType: "saved-group",
+          revision: baseRevision,
+          userId: "user-2",
+        }),
+      ).toBe(false);
+    });
+
+    it("returns true when user is in contributors and blockSelfApproval is on", () => {
+      expect(
+        isUserBlockedFromApproving({
+          settings: sgSettings(true),
+          entityType: "saved-group",
+          revision: baseRevision,
+          userId: "user-2",
+        }),
+      ).toBe(true);
+    });
+
+    it("returns true for the author when blockSelfApproval is on", () => {
+      expect(
+        isUserBlockedFromApproving({
+          settings: sgSettings(true),
+          entityType: "saved-group",
+          revision: baseRevision,
+          userId: "author-1",
+        }),
+      ).toBe(true);
+    });
+
+    it("returns false for a non-contributor reviewer", () => {
+      expect(
+        isUserBlockedFromApproving({
+          settings: sgSettings(true),
+          entityType: "saved-group",
+          revision: baseRevision,
+          userId: "user-3",
+        }),
+      ).toBe(false);
+    });
+
+    it("falls back to [authorId] for legacy revisions with no contributors field", () => {
+      const legacy = createRevision({
+        authorId: "author-1",
+        contributors: undefined,
+      });
+      expect(
+        isUserBlockedFromApproving({
+          settings: sgSettings(true),
+          entityType: "saved-group",
+          revision: legacy,
+          userId: "author-1",
+        }),
+      ).toBe(true);
+      expect(
+        isUserBlockedFromApproving({
+          settings: sgSettings(true),
+          entityType: "saved-group",
+          revision: legacy,
+          userId: "user-2",
+        }),
+      ).toBe(false);
+    });
+
+    it("returns false when settings is undefined", () => {
+      expect(
+        isUserBlockedFromApproving({
+          settings: undefined,
+          entityType: "saved-group",
+          revision: baseRevision,
+          userId: "author-1",
+        }),
+      ).toBe(false);
+    });
+
+    it("reads blockSelfApproval from requireReviews for constants", () => {
+      const constantRevision = createRevision({
+        authorId: "author-1",
+        contributors: ["author-1", "user-2"],
+        target: {
+          type: "constant",
+          id: "const-1",
+          snapshot: { project: "prj_a" } as Record<string, unknown>,
+          proposedChanges: [],
+        } as unknown as Revision["target"],
+      });
+      const settings = (blockSelfApproval: boolean) =>
+        ({
+          requireReviews: [
+            {
+              requireReviewOn: true,
+              blockSelfApproval,
+              projects: [],
+              environments: [],
+            },
+          ],
+        }) as unknown as OrganizationSettings;
+      expect(
+        isUserBlockedFromApproving({
+          settings: settings(true),
+          entityType: "constant",
+          revision: constantRevision,
+          userId: "user-2",
+        }),
+      ).toBe(true);
+      expect(
+        isUserBlockedFromApproving({
+          settings: settings(false),
+          entityType: "constant",
+          revision: constantRevision,
+          userId: "user-2",
+        }),
+      ).toBe(false);
+    });
+  });
+
+  describe("isAutopublishOnApprovalEnabled", () => {
+    const sgSettings = (autopublishOnApproval?: boolean) =>
+      ({
+        approvalFlows: {
+          savedGroups: [
+            {
+              required: true,
+              requireMetadataReview: false,
+              autopublishOnApproval,
+            },
+          ],
+        },
+      }) as OrganizationSettings;
+
+    it("returns false when settings is undefined", () => {
+      expect(isAutopublishOnApprovalEnabled(undefined, "saved-group")).toBe(
+        false,
+      );
+    });
+
+    it("returns true when autopublishOnApproval is enabled for the entity type", () => {
+      expect(
+        isAutopublishOnApprovalEnabled(sgSettings(true), "saved-group"),
+      ).toBe(true);
+    });
+
+    it("returns false when autopublishOnApproval is disabled", () => {
+      expect(
+        isAutopublishOnApprovalEnabled(sgSettings(false), "saved-group"),
+      ).toBe(false);
+    });
+
+    it("returns false when the flag is absent from the config", () => {
+      expect(
+        isAutopublishOnApprovalEnabled(sgSettings(undefined), "saved-group"),
+      ).toBe(false);
+    });
+
+    it("returns false for an entity type with no approval-flow config", () => {
+      expect(
+        isAutopublishOnApprovalEnabled(
+          sgSettings(true),
+          "unknown" as RevisionTargetType,
+        ),
+      ).toBe(false);
+    });
+
+    it("reads autopublishOnApproval from requireReviews for constants", () => {
+      const settings = {
+        requireReviews: [
+          {
+            requireReviewOn: true,
+            autopublishOnApproval: true,
+            projects: [],
+            environments: [],
+          },
+        ],
+      } as unknown as OrganizationSettings;
+      expect(
+        isAutopublishOnApprovalEnabled(settings, "constant", ["prj_a"]),
+      ).toBe(true);
+    });
+  });
+
+  describe("isSavedGroupRevisionMetadataOnly", () => {
+    it("returns false for an empty proposed-changes list", () => {
+      expect(isSavedGroupRevisionMetadataOnly([])).toBe(false);
+    });
+
+    it("returns false when proposedChanges is not an array (legacy format)", () => {
+      expect(
+        isSavedGroupRevisionMetadataOnly({ groupName: "v2" } as unknown),
+      ).toBe(false);
+    });
+
+    it.each([
+      [{ op: "replace", path: "/groupName", value: "v2" }],
+      [{ op: "replace", path: "/owner", value: "user-2" }],
+      [{ op: "replace", path: "/description", value: "new desc" }],
+      [{ op: "replace", path: "/projects", value: ["p1"] }],
+      [{ op: "replace", path: "/archived", value: true }],
+    ] as const)("returns true for a single metadata-field op (%j)", (op) => {
+      expect(isSavedGroupRevisionMetadataOnly([op])).toBe(true);
+    });
+
+    it("returns true when every op touches a metadata field", () => {
+      expect(
+        isSavedGroupRevisionMetadataOnly([
+          { op: "replace", path: "/groupName", value: "v2" },
+          { op: "add", path: "/description", value: "new desc" },
+          { op: "remove", path: "/owner" },
+        ]),
+      ).toBe(true);
+    });
+
+    it.each([
+      ["values", { op: "replace", path: "/values", value: ["a", "b"] }],
+      [
+        "condition",
+        {
+          op: "replace",
+          path: "/condition",
+          value: '{"id":"1"}',
+        },
+      ],
+      [
+        "attributeKey",
+        { op: "replace", path: "/attributeKey", value: "user_id" },
+      ],
+    ] as const)("returns false for a content-field op (%s)", (_label, op) => {
+      expect(isSavedGroupRevisionMetadataOnly([op])).toBe(false);
+    });
+
+    it("returns false when ops mix metadata and content fields", () => {
+      expect(
+        isSavedGroupRevisionMetadataOnly([
+          { op: "replace", path: "/groupName", value: "v2" },
+          { op: "replace", path: "/values", value: ["a"] },
+        ]),
+      ).toBe(false);
+    });
+
+    it("returns false for ops with malformed/unparseable paths", () => {
+      expect(
+        isSavedGroupRevisionMetadataOnly([
+          { op: "replace", path: "", value: "x" } as unknown as {
+            op: "replace";
+            path: string;
+            value: unknown;
+          },
+        ]),
+      ).toBe(false);
+      expect(
+        isSavedGroupRevisionMetadataOnly([
+          { op: "replace", path: "/", value: "x" } as unknown as {
+            op: "replace";
+            path: string;
+            value: unknown;
+          },
+        ]),
+      ).toBe(false);
+    });
+
+    it("treats nested paths by their top-level field (e.g. `/projects/0`)", () => {
+      // Top-level field is `projects` (a metadata field), so a nested write to
+      // `/projects/0` is still considered metadata-only. We never produce these
+      // in practice — saved-group revisions only patch top-level fields — but
+      // make the behaviour explicit.
+      expect(
+        isSavedGroupRevisionMetadataOnly([
+          { op: "replace", path: "/projects/0", value: "p1" },
+        ]),
+      ).toBe(true);
+    });
+  });
+
+  describe("isSavedGroupRevisionArchiveOnly", () => {
+    it("returns false for an empty proposed-changes list", () => {
+      expect(isSavedGroupRevisionArchiveOnly([])).toBe(false);
+    });
+
+    it("returns false when proposedChanges is not an array (legacy format)", () => {
+      expect(
+        isSavedGroupRevisionArchiveOnly({ archived: true } as unknown),
+      ).toBe(false);
+    });
+
+    it.each([true, false])(
+      "returns true for setting archived to %s",
+      (value) => {
+        expect(
+          isSavedGroupRevisionArchiveOnly([
+            { op: "replace", path: "/archived", value },
+          ]),
+        ).toBe(true);
+      },
+    );
+
+    it("returns false for another metadata field", () => {
+      expect(
+        isSavedGroupRevisionArchiveOnly([
+          { op: "replace", path: "/groupName", value: "v2" },
+        ]),
+      ).toBe(false);
+    });
+
+    it("returns false when archiving is mixed with other changes", () => {
+      expect(
+        isSavedGroupRevisionArchiveOnly([
+          { op: "replace", path: "/archived", value: true },
+          { op: "replace", path: "/currentUploadVersion", value: 2 },
+        ]),
+      ).toBe(false);
+    });
+  });
+
+  describe("isConstantRevisionMetadataOnly", () => {
+    it("returns false for an empty proposed-changes list", () => {
+      expect(isConstantRevisionMetadataOnly([])).toBe(false);
+    });
+
+    it("returns false when proposedChanges is not an array (legacy format)", () => {
+      expect(isConstantRevisionMetadataOnly({ name: "v2" } as unknown)).toBe(
+        false,
+      );
+    });
+
+    it.each([
+      [{ op: "replace", path: "/name", value: "v2" }],
+      [{ op: "replace", path: "/owner", value: "user-2" }],
+      [{ op: "replace", path: "/description", value: "new desc" }],
+      [{ op: "replace", path: "/project", value: "p1" }],
+      [{ op: "replace", path: "/archived", value: true }],
+    ] as const)("returns true for a single metadata-field op (%j)", (op) => {
+      expect(isConstantRevisionMetadataOnly([op])).toBe(true);
+    });
+
+    it.each([
+      ["value", { op: "replace", path: "/value", value: "https://x" }],
+      [
+        "environmentValues",
+        {
+          op: "replace",
+          path: "/environmentValues",
+          value: { staging: "https://staging" },
+        },
+      ],
+    ] as const)("returns false for a content-field op (%s)", (_label, op) => {
+      expect(isConstantRevisionMetadataOnly([op])).toBe(false);
+    });
+
+    it("returns false when ops mix metadata and content fields", () => {
+      expect(
+        isConstantRevisionMetadataOnly([
+          { op: "replace", path: "/name", value: "v2" },
+          { op: "replace", path: "/value", value: "v" },
+        ]),
+      ).toBe(false);
+    });
+  });
+
+  describe("getSdkConnectionGoverningRules", () => {
+    const base = { required: true, projects: [] as string[] };
+    const flows = (
+      sdkConnections: Record<string, unknown>[],
+    ): ApprovalFlowConfigurations =>
+      ({ savedGroups: [], sdkConnections }) as ApprovalFlowConfigurations;
+
+    it("applies the all-projects rule when no project rule exists", () => {
+      expect(
+        getSdkConnectionGoverningRules(flows([base]), {
+          projects: ["p1"],
+          environment: "production",
+        }),
+      ).toEqual([base]);
+    });
+
+    it("lets a project override switch approval off for its projects", () => {
+      const off = { required: false, projects: ["p1"] };
+      expect(
+        getSdkConnectionGoverningRules(flows([base, off]), {
+          projects: ["p1"],
+          environment: "production",
+        }),
+      ).toEqual([]);
+      expect(
+        getSdkConnectionGoverningRules(flows([base, off]), {
+          projects: ["p2"],
+          environment: "production",
+        }),
+      ).toEqual([base]);
+    });
+
+    it("uses the override's environments in place of the base rule's", () => {
+      const prodOnly = {
+        required: true,
+        projects: ["p1"],
+        environments: ["production"],
+      };
+      const rules = flows([base, prodOnly]);
+      expect(
+        getSdkConnectionGoverningRules(rules, {
+          projects: ["p1"],
+          environment: "production",
+        }),
+      ).toEqual([prodOnly]);
+      expect(
+        getSdkConnectionGoverningRules(rules, {
+          projects: ["p1"],
+          environment: "dev",
+        }),
+      ).toEqual([]);
+    });
+
+    it("keeps other projects gated when one project's override is off", () => {
+      const off = { required: false, projects: ["p1"] };
+      expect(
+        getSdkConnectionGoverningRules(flows([base, off]), {
+          projects: ["p1", "p2"],
+          environment: "production",
+        }),
+      ).toEqual([base]);
+    });
+
+    it("folds toggles only from rules covering the connection's environment", () => {
+      const prod = { required: true, environments: ["production"] };
+      const staging = {
+        required: true,
+        environments: ["staging"],
+        blockSelfApproval: true,
+      };
+      const rules = getSdkConnectionGoverningRules(flows([prod, staging]), {
+        projects: [],
+        environment: "production",
+      });
+      expect(rules).toHaveLength(1);
+      expect(rules[0].blockSelfApproval).toBeFalsy();
+    });
+
+    it("treats a connection with no projects as all-projects only", () => {
+      const p1 = { required: true, projects: ["p1"] };
+      expect(
+        getSdkConnectionGoverningRules(flows([p1]), {
+          projects: [],
+          environment: "production",
+        }),
+      ).toEqual([]);
+    });
+  });
+
+  describe("isSdkConnectionRevisionReviewExempt", () => {
+    const baseline = {
+      sdkConnection: {
+        name: "Prod",
+        environment: "production",
+        projects: [] as string[],
+        eventTracker: "segment",
+      },
+      sdkWebhooks: [],
+    };
+    const replaceSettings = (
+      value: Record<string, unknown>,
+    ): JsonPatchOperation[] => [
+      { op: "replace", path: "/sdkConnection", value },
+    ];
+
+    it("exempts a change to the event tracker alone", () => {
+      expect(
+        isSdkConnectionRevisionReviewExempt(
+          replaceSettings({ ...baseline.sdkConnection, eventTracker: "ga4" }),
+          baseline,
+        ),
+      ).toBe(true);
+    });
+
+    it("does not exempt the event tracker changed with anything else", () => {
+      expect(
+        isSdkConnectionRevisionReviewExempt(
+          replaceSettings({
+            ...baseline.sdkConnection,
+            eventTracker: "ga4",
+            name: "Renamed",
+          }),
+          baseline,
+        ),
+      ).toBe(false);
+    });
+
+    it("does not exempt a rename", () => {
+      expect(
+        isSdkConnectionRevisionReviewExempt(
+          replaceSettings({ ...baseline.sdkConnection, name: "Renamed" }),
+          baseline,
+        ),
+      ).toBe(false);
+    });
+  });
+
+  describe("isSdkConnectionRevisionMetadataOnly", () => {
+    const baseline = {
+      sdkConnection: {
+        name: "Prod",
+        environment: "production",
+        projects: [] as string[],
+        encryptPayload: false,
+        proxyHost: "",
+      },
+      sdkWebhooks: [],
+    };
+    const replaceSettings = (
+      value: Record<string, unknown>,
+    ): JsonPatchOperation[] => [
+      { op: "replace", path: "/sdkConnection", value },
+    ];
+
+    it("returns false without a baseline snapshot", () => {
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          replaceSettings({ ...baseline.sdkConnection, name: "Renamed" }),
+        ),
+      ).toBe(false);
+    });
+
+    it("returns true for a name-only change", () => {
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          replaceSettings({ ...baseline.sdkConnection, name: "Renamed" }),
+          baseline,
+        ),
+      ).toBe(true);
+    });
+
+    it("treats false / empty string / empty array as equal to absent", () => {
+      // A draft built elsewhere (REST) omits fields the live connection
+      // stores as `false`, `""` or `[]`.
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          replaceSettings({ name: "Renamed", environment: "production" }),
+          baseline,
+        ),
+      ).toBe(true);
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          replaceSettings({
+            ...baseline.sdkConnection,
+            name: "Renamed",
+            encryptPayload: null,
+            proxyHost: undefined,
+          }),
+          baseline,
+        ),
+      ).toBe(true);
+    });
+
+    it("returns false when a setting really changes alongside the name", () => {
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          replaceSettings({
+            ...baseline.sdkConnection,
+            name: "Renamed",
+            encryptPayload: true,
+          }),
+          baseline,
+        ),
+      ).toBe(false);
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          replaceSettings({ ...baseline.sdkConnection, projects: ["p1"] }),
+          baseline,
+        ),
+      ).toBe(false);
+    });
+
+    it("returns false when nothing changed or a webhook op is present", () => {
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          replaceSettings({ ...baseline.sdkConnection }),
+          baseline,
+        ),
+      ).toBe(false);
+      expect(
+        isSdkConnectionRevisionMetadataOnly(
+          [
+            ...replaceSettings({ ...baseline.sdkConnection, name: "Renamed" }),
+            { op: "replace", path: "/sdkWebhooks", value: [] },
+          ],
+          baseline,
+        ),
+      ).toBe(false);
+    });
+  });
+});
+
+describe("SDK connection nested merges", () => {
+  const fields = new Set(["sdkConnection", "sdkWebhooks"]);
+  const wh = (id: string, name: string) => ({
+    id,
+    name,
+    endpoint: "https://x",
+  });
+  const base = {
+    sdkConnection: {
+      name: "A",
+      includeRuleIds: false,
+      hashSecureAttributes: true,
+    },
+    sdkWebhooks: [wh("w1", "one"), wh("w2", "two")],
+  };
+
+  it("auto-merges a draft and a live edit to different settings", () => {
+    const live = {
+      ...base,
+      sdkConnection: { ...base.sdkConnection, includeRuleIds: true },
+    };
+    const ops = [
+      {
+        op: "replace" as const,
+        path: "/sdkConnection",
+        value: { ...base.sdkConnection, name: "B" },
+      },
+    ];
+    const result = checkMergeConflicts(base, live, ops, fields);
+    expect(result.success).toBe(true);
+    expect(result.mergedChanges.sdkConnection).toEqual({
+      name: "B",
+      includeRuleIds: true,
+      hashSecureAttributes: true,
+    });
+  });
+
+  it("conflicts only when both sides changed the same setting, proposing just the draft's edits", () => {
+    const live = {
+      ...base,
+      sdkConnection: {
+        ...base.sdkConnection,
+        name: "Live",
+        includeRuleIds: true,
+      },
+    };
+    const ops = [
+      {
+        op: "replace" as const,
+        path: "/sdkConnection",
+        value: { ...base.sdkConnection, name: "Draft" },
+      },
+    ];
+    const result = checkMergeConflicts(base, live, ops, fields);
+    expect(result.success).toBe(false);
+    expect(result.conflicts[0].proposedValue).toEqual({
+      name: "Draft",
+      includeRuleIds: true,
+      hashSecureAttributes: true,
+    });
+  });
+
+  it("merges webhooks by id so a live-added webhook survives a draft edit", () => {
+    const live = {
+      ...base,
+      sdkWebhooks: [...base.sdkWebhooks, wh("w3", "new")],
+    };
+    const ops = [
+      {
+        op: "replace" as const,
+        path: "/sdkWebhooks",
+        value: [wh("w1", "one renamed")],
+      },
+    ];
+    const result = checkMergeConflicts(base, live, ops, fields);
+    expect(result.success).toBe(true);
+    expect(result.mergedChanges.sdkWebhooks).toEqual([
+      wh("w1", "one renamed"),
+      wh("w3", "new"),
+    ]);
+  });
+
+  it("keeps live on colliding keys when preferring live", () => {
+    expect(
+      mergeNestedBranch(
+        "sdkConnection",
+        { name: "A", tags: false },
+        { name: "Live", tags: false },
+        { name: "Draft", tags: true },
+        "live",
+      ),
+    ).toEqual({ merged: { name: "Live", tags: true }, conflicts: ["name"] });
+  });
+
+  it("ignores fields that aren't nested branches", () => {
+    expect(mergeNestedBranch("values", [], [], [], "proposed")).toBeNull();
+  });
+
+  describe("webhook saves into a draft", () => {
+    const merge = (b: unknown, theirs: unknown, mine: unknown) =>
+      mergeNestedBranch("sdkWebhooks", b, theirs, mine, "proposed");
+
+    it("keeps a webhook someone else added while this edit adds another", () => {
+      expect(
+        merge(
+          [wh("w1", "one")],
+          [wh("w1", "one"), wh("w2", "two")],
+          [wh("w1", "one"), wh("w3", "three")],
+        ),
+      ).toEqual({
+        merged: [wh("w1", "one"), wh("w2", "two"), wh("w3", "three")],
+        conflicts: [],
+      });
+    });
+
+    it("conflicts when both edited the same webhook differently", () => {
+      expect(
+        merge([wh("w1", "one")], [wh("w1", "theirs")], [wh("w1", "mine")])
+          ?.conflicts,
+      ).toEqual(["w1"]);
+    });
+
+    it("leaves a webhook they deleted deleted when this edit didn't touch it", () => {
+      expect(
+        merge(
+          [wh("w1", "one"), wh("w2", "two")],
+          [wh("w1", "one")],
+          [wh("w1", "one renamed"), wh("w2", "two")],
+        ),
+      ).toEqual({ merged: [wh("w1", "one renamed")], conflicts: [] });
+    });
+  });
+});
+
+describe("sdkConnectionDraftSettingsAfterSave", () => {
+  it("doesn't take a setting from live that the draft doesn't hold", () => {
+    // Live picked up an event tracker and was archived after the draft was
+    // made; the draft only renamed.
+    const base = { name: "A", includeRuleIds: false };
+    const draft = { name: "B", includeRuleIds: false };
+    const live = { ...base, eventTracker: "GA4", archived: true };
+    expect(
+      sdkConnectionDraftSettingsAfterSave(base, draft, { name: "C" }, live),
+    ).toEqual({ name: "C", includeRuleIds: false });
+  });
+
+  it("keeps a setting cleared in the draft when live has since set it", () => {
+    // The draft is shown with live's tracker, so clearing it there is a
+    // choice, not a return to where the draft started.
+    const base = { name: "A" };
+    const draft = { name: "B" };
+    const live = { name: "A", eventTracker: "GA4" };
+    expect(
+      sdkConnectionDraftSettingsAfterSave(
+        base,
+        draft,
+        { eventTracker: "" },
+        live,
+      ),
+    ).toEqual({ name: "B", eventTracker: "" });
+  });
+
+  it("keeps that choice through a later save of something else", () => {
+    const base = { name: "A" };
+    const live = { name: "A", includeRuleIds: true };
+    const cleared = sdkConnectionDraftSettingsAfterSave(
+      base,
+      { name: "A" },
+      { includeRuleIds: false },
+      live,
+    );
+    expect(cleared).toEqual({ name: "A", includeRuleIds: false });
+    expect(
+      sdkConnectionDraftSettingsAfterSave(base, cleared, { name: "B" }, live),
+    ).toEqual({ name: "B", includeRuleIds: false });
+  });
+
+  it("leaves no change after a setting is turned on then off", () => {
+    const base = { name: "A" };
+    const on = sdkConnectionDraftSettingsAfterSave(base, base, {
+      includeDraftExperimentRefs: true,
+    });
+    expect(on).toEqual({ name: "A", includeDraftExperimentRefs: true });
+    expect(
+      sdkConnectionDraftSettingsAfterSave(base, on, {
+        includeDraftExperimentRefs: false,
+      }),
+    ).toEqual(base);
+  });
+
+  it("keeps the base's form for a setting set back to it", () => {
+    const base = { name: "A", projects: [], tags: false };
+    expect(
+      sdkConnectionDraftSettingsAfterSave(
+        base,
+        { name: "A", projects: ["p1"], tags: false },
+        { projects: undefined },
+      ),
+    ).toEqual(base);
+  });
+});
+
+describe("SDK connection review rules", () => {
+  const flows = (
+    sdkConnections: Record<string, unknown>[],
+  ): ApprovalFlowConfigurations =>
+    ({ savedGroups: [], sdkConnections }) as ApprovalFlowConfigurations;
+  const snapshot = {
+    sdkConnection: {
+      name: "A",
+      projects: [],
+      environment: "production",
+      includeRuleIds: false,
+    },
+    sdkWebhooks: [],
+  };
+  const rename = [
+    {
+      op: "replace" as const,
+      path: "/sdkConnection",
+      value: { ...snapshot.sdkConnection, name: "B" },
+    },
+  ];
+
+  it("drops rules that skip metadata review for a rename", () => {
+    const rule = { required: true, requireMetadataReview: false };
+    expect(
+      getSdkConnectionReviewRules(flows([rule]), snapshot, rename),
+    ).toEqual([]);
+  });
+
+  it("blocks self-approval only from the rule governing the environment", () => {
+    const settings = {
+      approvalFlows: flows([
+        { required: true, environments: ["production"] },
+        {
+          required: true,
+          environments: ["staging"],
+          blockSelfApproval: true,
+        },
+      ]),
+    } as OrganizationSettings;
+    expect(
+      isUserBlockedFromApproving({
+        settings,
+        entityType: "sdk-connection",
+        revision: {
+          authorId: "u1",
+          contributors: ["u1"],
+          target: {
+            type: "sdk-connection",
+            id: "sdk-1",
+            snapshot,
+            proposedChanges: rename,
+          },
+        } as unknown as Revision,
+        userId: "u1",
+      }),
+    ).toBe(false);
+  });
+
+  it("scopes the publish footprint to the connection's environments", () => {
+    const move = [
+      {
+        op: "replace" as const,
+        path: "/sdkConnection",
+        value: { ...snapshot.sdkConnection, environment: "staging" },
+      },
+    ];
+    expect(entityPublishFootprint("sdk-connection", snapshot, move)).toEqual({
+      scope: "environments",
+      environments: ["production", "staging"],
+    });
+  });
+});
+
+describe("landedOps", () => {
+  const base = {
+    name: "Prod",
+    sdkConnection: { name: "Prod", encryptPayload: false, environment: "prod" },
+  };
+  // Since the draft was cut, live turned encryption on.
+  const live = {
+    name: "Prod",
+    sdkConnection: { name: "Prod", encryptPayload: true, environment: "prod" },
+  };
+
+  it("lands a nested branch's own changes and keeps what live changed since", () => {
+    const ops: JsonPatchOperation[] = [
+      {
+        op: "replace",
+        path: "/sdkConnection",
+        value: { ...base.sdkConnection, name: "Renamed" },
+      },
+    ];
+    expect(landedOps(live, base, ops)).toEqual([
+      {
+        op: "replace",
+        path: "/sdkConnection",
+        value: { name: "Renamed", encryptPayload: true, environment: "prod" },
+      },
+    ]);
+  });
+
+  it("keeps live's key order, so a setting added to live since isn't shown as moved", () => {
+    const liveWithTracker = {
+      ...live,
+      sdkConnection: {
+        name: "Prod",
+        eventTracker: "segment",
+        encryptPayload: true,
+        environment: "prod",
+      },
+    };
+    const ops: JsonPatchOperation[] = [
+      {
+        op: "replace",
+        path: "/sdkConnection",
+        value: { ...base.sdkConnection, name: "Renamed" },
+      },
+    ];
+    const [landed] = landedOps(liveWithTracker, base, ops);
+    expect(
+      Object.keys((landed as { value: Record<string, unknown> }).value),
+    ).toEqual(Object.keys(liveWithTracker.sdkConnection));
+  });
+
+  it("drops what isn't a change, or isn't the entity's to write", () => {
+    const ops: JsonPatchOperation[] = [
+      { op: "replace", path: "/name", value: "Prod" },
+      { op: "remove", path: "/neverThere" },
+      { op: "replace", path: "/owner", value: "someone" },
+    ];
+    expect(landedOps(live, base, ops, new Set(["name"]))).toEqual([]);
+    // Without an allowlist, the real change stays.
+    expect(landedOps(live, base, ops)).toEqual([ops[2]]);
+  });
+
+  it("drops a clear of a field the snapshot never had, keeping live's", () => {
+    const ops: JsonPatchOperation[] = [
+      { op: "replace", path: "/schema", value: null },
+    ];
+    expect(landedOps({ ...live, schema: { fields: [] } }, base, ops)).toEqual(
+      [],
+    );
+  });
+});
+
+describe("reviewCoverageProjects", () => {
+  const snapshot = { sdkConnection: { projects: ["a"], environment: "prod" } };
+  const moveTo = (projects: string[]): JsonPatchOperation[] => [
+    {
+      op: "replace",
+      path: "/sdkConnection",
+      value: { projects, environment: "prod" },
+    },
+  ];
+
+  it("covers where a connection leaves and where it lands", () => {
+    expect(
+      reviewCoverageProjects("sdk-connection", snapshot, moveTo(["b"])),
+    ).toEqual(["a", "b"]);
+    expect(reviewCoverageProjects("sdk-connection", snapshot, [])).toEqual([
+      "a",
+    ]);
+  });
+
+  it("is every Project when either side is", () => {
+    expect(
+      reviewCoverageProjects("sdk-connection", snapshot, moveTo([])),
+    ).toEqual([]);
+  });
+
+  it("reads other entities from the snapshot alone", () => {
+    expect(
+      reviewCoverageProjects("saved-group", { projects: ["a"] }, [
+        { op: "replace", path: "/projects", value: ["b"] },
+      ]),
+    ).toEqual(["a"]);
+  });
+});

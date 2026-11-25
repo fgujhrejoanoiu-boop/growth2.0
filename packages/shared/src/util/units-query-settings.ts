@@ -1,0 +1,72 @@
+import { ExperimentSnapshotSettings } from "shared/types/experiment-snapshot";
+import {
+  ExperimentUnitsQuerySettings,
+  ResolvedExposureQuery,
+} from "shared/types/integrations";
+import type { SqlIdentifierQuote } from "shared/types/sql";
+import { queryHasContextualBanditVersionColumn } from "../validators/exposure-query-targeting-attribute-columns";
+import { ContextualBanditSnapshotSettings } from "../validators/contextual-bandit-snapshot";
+
+export function buildUnitsQuerySettingsFromSnapshot(
+  settings: ExperimentSnapshotSettings,
+  exposureQuery: ResolvedExposureQuery,
+): ExperimentUnitsQuerySettings {
+  return {
+    experimentId: settings.experimentId,
+    exposureQuery,
+    isClusterExperiment: settings.isClusterExperiment,
+    clusterSubUnitIdentifier: settings.clusterSubUnitIdentifier,
+    startDate: settings.startDate,
+    endDate: settings.endDate,
+    endDateIsCutoff: settings.endDateIsCutoff,
+    skipPartialData: settings.skipPartialData,
+    attributionModel: settings.attributionModel,
+    queryFilter: settings.queryFilter,
+    phase: settings.phase,
+    customFields: settings.customFields,
+    variations: settings.variations,
+    banditSettings: settings.banditSettings,
+    metricSettings: settings.metricSettings,
+  };
+}
+
+export function buildUnitsQuerySettingsFromCb(
+  cbSettings: ContextualBanditSnapshotSettings,
+  identifierQuote: SqlIdentifierQuote,
+): ExperimentUnitsQuerySettings {
+  const decisionMetric = cbSettings.decisionMetric;
+  return {
+    experimentId: cbSettings.trackingKey,
+    exposureQuery: {
+      query: cbSettings.query,
+      identifierType: cbSettings.userIdType,
+    },
+    startDate: cbSettings.startDate,
+    endDate: cbSettings.endDate ?? new Date(),
+    skipPartialData: false,
+    attributionModel: "firstExposure",
+    queryFilter: "",
+    variations: cbSettings.variations,
+    metricSettings: [],
+    banditSettings: {
+      contextualBandit: true,
+      // Always attribute each user to their first exposure in the lookback
+      // window; never bucket multi-variation users as '__multiple__'
+      useFirstExposure: true,
+      targetingAttributeColumns: cbSettings.contextualAttributes,
+      reweight: cbSettings.reweight,
+      decisionMetric,
+      seed: cbSettings.banditWeightsSeed,
+      currentWeights: cbSettings.variations.map((v) => v.weight),
+      historicalWeights: [],
+      // Period weighting groups on the assignment query's `bandit_version`
+      // column, so only enable it when the query actually emits that column.
+      periodWeighting:
+        cbSettings.periodWeighting === true &&
+        queryHasContextualBanditVersionColumn(
+          cbSettings.query,
+          identifierQuote,
+        ),
+    },
+  };
+}

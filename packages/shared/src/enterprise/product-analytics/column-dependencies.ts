@@ -1,0 +1,221 @@
+import { z } from "zod";
+import { RowFilter } from "shared/types/fact-table";
+import { SqlIdentifierQuote } from "shared/types/sql";
+import {
+  dimensionValidator,
+  factTableExplorationConfigValidator,
+  funnelExplorationConfigValidator,
+  journeyExplorationConfigValidator,
+  metricExplorationConfigValidator,
+  dataSourceExplorationConfigValidator,
+  sqlExplorationConfigValidator,
+  populationExplorationConfigValidator,
+} from "../../validators/product-analytics";
+import type { PopulationInterface } from "../../validators/population";
+import { sqlReferencesColumn } from "../../sql";
+
+// The exploration config shape persisted by both saved explorations and
+// dashboard "exploration" blocks. Metric definitions are covered by the
+// fact-metric dependency scan; their dataset population only references a
+// saved Population, which `populationReferencesColumn` scans.
+type ExplorationConfig =
+  | z.infer<typeof metricExplorationConfigValidator>
+  | z.infer<typeof factTableExplorationConfigValidator>
+  | z.infer<typeof dataSourceExplorationConfigValidator>
+  | z.infer<typeof sqlExplorationConfigValidator>
+  | z.infer<typeof funnelExplorationConfigValidator>
+  | z.infer<typeof journeyExplorationConfigValidator>
+  | z.infer<typeof populationExplorationConfigValidator>;
+
+type Dimension = z.infer<typeof dimensionValidator>;
+
+// A saved filter, by id and raw SQL, so `saved_filter` row filters can be
+// resolved to the SQL they reference.
+type SavedFilter = { id: string; value: string };
+
+// A row filter references `columnName` when it targets the column directly, via
+// a raw `sql_expr`, or via a `saved_filter` whose resolved SQL references it.
+// Resolving `saved_filter` here (against the fact table's own filters) keeps
+// this scan self-contained rather than relying on a separate filter scan.
+function rowFilterReferencesColumn(
+  rowFilter: RowFilter,
+  columnName: string,
+  identifierQuote: SqlIdentifierQuote,
+  filters: SavedFilter[],
+): boolean {
+  if (rowFilter.column === columnName) return true;
+  if (
+    rowFilter.operator === "sql_expr" &&
+    rowFilter.values?.[0] &&
+    sqlReferencesColumn(rowFilter.values[0], columnName, identifierQuote)
+  ) {
+    return true;
+  }
+  if (rowFilter.operator === "saved_filter" && rowFilter.values?.[0]) {
+    const filter = filters.find((f) => f.id === rowFilter.values?.[0]);
+    if (
+      filter &&
+      sqlReferencesColumn(filter.value, columnName, identifierQuote)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function dimensionReferencesColumn(
+  dimension: Dimension,
+  columnName: string,
+  identifierQuote: SqlIdentifierQuote,
+  filters: SavedFilter[],
+): boolean {
+  switch (dimension.dimensionType) {
+    case "date":
+    case "dynamic":
+    case "static":
+      return dimension.column === columnName;
+    case "slice":
+      return dimension.slices.some((slice) =>
+        slice.filters.some((f) =>
+          rowFilterReferencesColumn(f, columnName, identifierQuote, filters),
+        ),
+      );
+    default:
+      return false;
+  }
+}
+
+/**
+ * Whether a saved Population reads `columnName` on this fact table: as an
+ * identifier type's column, an aggregate filter column, or in a step's row
+ * filters.
+ */
+export function populationReferencesColumn(
+  population: Pick<PopulationInterface, "steps" | "userIdTypes">,
+  factTable: { id: string; userIdColumns?: Record<string, string> },
+  columnName: string,
+  identifierQuote: SqlIdentifierQuote,
+  filters: SavedFilter[],
+): boolean {
+  // An identifier type reads the column it's mapped to, or the column of its
+  // own name when it isn't mapped.
+  const identifierColumns = population.userIdTypes.map(
+    (idType) => (factTable.userIdColumns?.[idType] ?? idType).split(".")[0],
+  );
+  return population.steps.some(
+    (step) =>
+      step.source.factTableId === factTable.id &&
+      (identifierColumns.includes(columnName) ||
+        step.aggregateFilterColumn === columnName ||
+        step.rowFilters.some((f) =>
+          rowFilterReferencesColumn(f, columnName, identifierQuote, filters),
+        )),
+  );
+}
+
+/**
+ * Whether an exploration/dashboard-block config references `columnName` on the
+ * fact table `factTableId`. Used to block deletion of a virtual column that a
+ * saved exploration or dashboard block still depends on — those surfaces
+ * persist `valueColumn`, dimension, and row-filter references (including
+ * `saved_filter` references, resolved against `filters`) that resolve through
+ * the same query-time chokepoint as metrics.
+ */
+export function explorationConfigReferencesColumn(
+  config: ExplorationConfig,
+  factTableId: string,
+  columnName: string,
+  identifierQuote: SqlIdentifierQuote,
+  filters: SavedFilter[],
+): boolean {
+  // Metric definitions are covered by the fact-metric scan, and the dataset
+  // population by the saved Population scan.
+  if (config.type === "metric") return false;
+
+  if (config.type === "fact_table") {
+    if (config.dataset.factTableId !== factTableId) return false;
+
+    const valueReferences = config.dataset.values.some(
+      (value) =>
+        value.valueColumn === columnName ||
+        value.rowFilters.some((f) =>
+          rowFilterReferencesColumn(f, columnName, identifierQuote, filters),
+        ),
+    );
+    if (valueReferences) return true;
+
+    return config.dimensions.some((d) =>
+      dimensionReferencesColumn(d, columnName, identifierQuote, filters),
+    );
+  }
+
+  if (config.type === "funnel") {
+    const stepMatches = config.dataset.steps.some(
+      (step) =>
+        step.factTableId === factTableId &&
+        step.rowFilters.some((f) =>
+          rowFilterReferencesColumn(f, columnName, identifierQuote, filters),
+        ),
+    );
+    if (stepMatches) return true;
+
+    // Dimensions on a funnel are evaluated against the funnel's fact tables, so
+    // only scan them when this fact table participates in the funnel.
+    const usesFactTable = config.dataset.steps.some(
+      (step) => step.factTableId === factTableId,
+    );
+    if (!usesFactTable) return false;
+
+    return config.dimensions.some((d) =>
+      dimensionReferencesColumn(d, columnName, identifierQuote, filters),
+    );
+  }
+
+  if (config.type === "journey") {
+    if (config.dataset.factTableId !== factTableId) return false;
+
+    if (config.dataset.unit === columnName) return true;
+    if (config.dataset.stepColumns.includes(columnName)) return true;
+    if (
+      config.dataset.stepGroups?.some((g) => g.column === columnName) ??
+      false
+    ) {
+      return true;
+    }
+    if (
+      config.dataset.rowFilters.some((f) =>
+        rowFilterReferencesColumn(f, columnName, identifierQuote, filters),
+      )
+    ) {
+      return true;
+    }
+
+    return config.dimensions.some((d) =>
+      dimensionReferencesColumn(d, columnName, identifierQuote, filters),
+    );
+  }
+
+  if (config.type === "population") {
+    const values = config.dataset.values.filter(
+      (value) => value.source.factTableId === factTableId,
+    );
+    if (!values.length) return false;
+
+    const valueReferences = values.some(
+      (value) =>
+        value.unit === columnName ||
+        value.aggregateFilterColumn === columnName ||
+        value.rowFilters.some((f) =>
+          rowFilterReferencesColumn(f, columnName, identifierQuote, filters),
+        ),
+    );
+    if (valueReferences) return true;
+
+    return config.dimensions.some((d) =>
+      dimensionReferencesColumn(d, columnName, identifierQuote, filters),
+    );
+  }
+
+  // data_source / sql configs never reference fact-table columns directly.
+  return false;
+}

@@ -1,0 +1,639 @@
+import { isEqual, omit, uniqWith } from "lodash";
+import { getSnapshotCutoffDate, isString } from "shared/util";
+import { ExperimentMetricInterface } from "shared/experiments";
+import { getScopedSettings } from "shared/settings";
+import {
+  blockHasFieldOfType,
+  buildComparisonExplorationConfig,
+  BlockSnapshotSettings,
+  getBlockAnalysisSettings,
+  getBlockSnapshotAnalysis,
+  getBlockSnapshotSettings,
+  getEffectiveExplorationConfig,
+  snapshotSatisfiesBlock,
+  DashboardBlockWithAnalysisId,
+  DashboardInterface,
+  MetricExplorerBlockInterface,
+  DashboardBlockInterface,
+  resolveBlockComparison,
+  resolveComparisonPreviousTimeFrame,
+} from "shared/enterprise";
+import {
+  ExperimentSnapshotAnalysisSettings,
+  ExperimentSnapshotInterface,
+} from "shared/types/experiment-snapshot";
+
+import { ExperimentInterface } from "shared/types/experiment";
+import { MetricSnapshotSettings } from "shared/types/report";
+import { StatsEngine } from "shared/types/stats";
+import { MetricAnalysisSettings } from "shared/types/metric-analysis";
+import { findSnapshotsByIds } from "back-end/src/models/ExperimentSnapshotModel";
+
+import { ReqContext } from "back-end/types/request";
+
+import { FactTableMap } from "back-end/src/models/FactTableModel";
+import { ApiReqContext } from "back-end/types/api";
+import { getDataSourcesByIds } from "back-end/src/models/DataSourceModel";
+import { executeAndSaveQuery } from "back-end/src/routers/saved-queries/saved-queries.controller";
+import {
+  getDefaultExperimentAnalysisSettings,
+  createSnapshot,
+  getAdditionalExperimentAnalysisSettings,
+  determineNextDate,
+} from "back-end/src/services/experiments";
+import { createMetricAnalysis } from "back-end/src/services/metric-analysis";
+import { runProductAnalyticsExploration } from "back-end/src/enterprise/services/product-analytics";
+import { BadRequestError } from "back-end/src/util/errors";
+import { logger } from "back-end/src/util/logger";
+
+/**
+ * Determines if nextUpdate should be recalculated based on changes to auto-updates or schedule
+ */
+export function shouldRecalculateNextUpdate(
+  updates: {
+    enableAutoUpdates?: boolean;
+    updateSchedule?: DashboardInterface["updateSchedule"];
+  },
+  dashboard: DashboardInterface,
+): boolean {
+  // Auto-updates being disabled - clear nextUpdate
+  if (updates.enableAutoUpdates === false) {
+    return false;
+  }
+
+  // Auto-updates not enabled - no update needed
+  const enableAutoUpdates =
+    updates.enableAutoUpdates ?? dashboard.enableAutoUpdates;
+  if (!enableAutoUpdates) {
+    return false;
+  }
+
+  // Auto-updates being turned on for the first time
+  if (updates.enableAutoUpdates === true && !dashboard.enableAutoUpdates) {
+    return true;
+  }
+
+  // Schedule is being changed
+  if (
+    updates.updateSchedule &&
+    !isEqual(updates.updateSchedule, dashboard.updateSchedule)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// To be run after creating the main/standard snapshot. Re-uses some of the variables for efficiency
+export async function updateExperimentDashboards({
+  context,
+  experiment,
+  mainSnapshot,
+  statsEngine,
+  regressionAdjustmentEnabled,
+  postStratificationEnabled,
+  settingsForSnapshotMetrics,
+  metricMap,
+  factTableMap,
+}: {
+  context: ReqContext | ApiReqContext;
+  experiment: ExperimentInterface;
+  mainSnapshot: ExperimentSnapshotInterface;
+  statsEngine: StatsEngine;
+  regressionAdjustmentEnabled: boolean;
+  postStratificationEnabled: boolean;
+  settingsForSnapshotMetrics: MetricSnapshotSettings[];
+  metricMap: Map<string, ExperimentMetricInterface>;
+  factTableMap: FactTableMap;
+}) {
+  const associatedDashboards = await context.models.dashboards.findByExperiment(
+    experiment.id,
+    {
+      enableAutoUpdates: true,
+    },
+  );
+
+  // Grouping and deduping the blocks across all dashboards to run the minimum number of snapshots necessary
+  const allBlocks = associatedDashboards.flatMap((dash) => dash.blocks);
+  // Note: blocks for other experiments won't be updated during this flow.
+  // Expected behavior is that dashboards tied to experiments don't include references to other experiments
+  const blocksWithSnapshots = allBlocks
+    .filter((block) => blockHasFieldOfType(block, "snapshotId", isString))
+    .filter((block) => block.experimentId === experiment.id);
+  const blocksNeedingSnapshot = blocksWithSnapshots.filter(
+    (block) =>
+      block.snapshotId.length > 0 &&
+      !snapshotSatisfiesBlock(mainSnapshot, block),
+  );
+  const previousSnapshotIds = [
+    ...new Set(blocksNeedingSnapshot.map((block) => block.snapshotId)),
+  ];
+  const previousSnapshots = await findSnapshotsByIds(
+    context,
+    previousSnapshotIds,
+  );
+  const previousSnapshotMap = new Map(
+    previousSnapshots.map((snap) => [snap.id, snap]),
+  );
+
+  const snapshotAndAnalysisSettingPairs = blocksNeedingSnapshot.map<
+    [BlockSnapshotSettings, ExperimentSnapshotAnalysisSettings]
+  >((block) => {
+    const blockSnapshot = previousSnapshotMap.get(block.snapshotId);
+    if (!blockSnapshot)
+      throw new Error(
+        "Error updating dashboard results, could not find snapshot",
+      );
+    if (!blockSnapshot.analyses[0])
+      throw new Error(
+        "Error updating dashboard results, referenced snapshot missing analysis",
+      );
+    const defaultAnalysis = blockSnapshot.analyses[0];
+    return [
+      getBlockSnapshotSettings(block),
+      getBlockAnalysisSettings(
+        block,
+        (getBlockSnapshotAnalysis(blockSnapshot, block) ?? defaultAnalysis)
+          .settings,
+      ),
+    ];
+  });
+
+  const uniqueSnapshotSettings = uniqWith<BlockSnapshotSettings>(
+    snapshotAndAnalysisSettingPairs.map(
+      ([snapshotSettings]) => snapshotSettings,
+    ),
+    isEqual,
+  );
+
+  const dashboardProject = experiment.project
+    ? ((await context.models.projects.getById(experiment.project)) ?? undefined)
+    : undefined;
+  const { settings: scopedDashboardSettings } = getScopedSettings({
+    organization: context.org,
+    project: dashboardProject,
+    experiment,
+  });
+  const metricGroups = await context.models.metricGroups.getAll();
+
+  for (const snapshotSettings of uniqueSnapshotSettings) {
+    const additionalAnalysisSettings =
+      uniqWith<ExperimentSnapshotAnalysisSettings>(
+        snapshotAndAnalysisSettingPairs
+          .filter(([targetSettings]) =>
+            isEqual(snapshotSettings, targetSettings),
+          )
+          .map(([_, analysisSettings]) => analysisSettings),
+        isEqual,
+      );
+
+    const analysisSettings = getDefaultExperimentAnalysisSettings({
+      statsEngine,
+      experiment,
+      organization: context.org,
+      regressionAdjustmentEnabled,
+      postStratificationEnabled,
+      dimension: snapshotSettings.dimensionId,
+      pValueThreshold: scopedDashboardSettings.pValueThreshold.value,
+      pValueCorrection: scopedDashboardSettings.pValueCorrection.value,
+      metricGroups,
+    });
+
+    const queryRunner = await createSnapshot({
+      experiment,
+      context,
+      phaseIndex: experiment.phases.length - 1,
+      defaultAnalysisSettings: analysisSettings,
+      additionalAnalysisSettings: getAdditionalExperimentAnalysisSettings(
+        analysisSettings,
+      ).concat(additionalAnalysisSettings),
+      settingsForSnapshotMetrics: settingsForSnapshotMetrics || [],
+      metricMap,
+      factTableMap,
+      useCache: true,
+      type: "exploratory",
+      triggeredBy: "update-dashboards",
+      cutoff: getSnapshotCutoffDate(mainSnapshot.settings),
+    });
+    await queryRunner.waitForResults();
+  }
+
+  await updateDashboardSavedQueries(context, allBlocks);
+  for (const dashboard of associatedDashboards) {
+    const editableBlocks = dashboard.blocks.map((block) =>
+      block.type === "metric-explorer" ? { ...block } : block,
+    );
+    const metricAnalysesUpdated = await updateDashboardMetricAnalyses(
+      context,
+      editableBlocks,
+    );
+    const explorationsUpdated = await updateDashboardExplorations(
+      context,
+      editableBlocks,
+      dashboard,
+    );
+    if (metricAnalysesUpdated || explorationsUpdated) {
+      await context.models.dashboards.dangerousUpdateBypassPermission(
+        dashboard,
+        { blocks: editableBlocks },
+      );
+    }
+  }
+}
+
+export async function updateNonExperimentDashboard(
+  context: ReqContext | ApiReqContext,
+  dashboard: DashboardInterface,
+) {
+  // Copy the blocks of the dashboard to overwrite their fields
+  const newBlocks = dashboard.blocks.map((block) => ({ ...block }));
+  await updateDashboardMetricAnalyses(context, newBlocks);
+  await updateDashboardSavedQueries(context, newBlocks);
+  await updateDashboardExplorations(context, newBlocks, dashboard);
+  await context.models.dashboards.dangerousUpdateBypassPermission(dashboard, {
+    blocks: newBlocks,
+    nextUpdate:
+      determineNextDate(dashboard.updateSchedule || null) ?? undefined,
+    lastUpdated: new Date(),
+  });
+}
+
+// Returns a boolean indicating whether the blocks have been modified and will need to be saved to db
+export async function updateDashboardMetricAnalyses(
+  context: ReqContext | ApiReqContext,
+  blocks: DashboardInterface["blocks"],
+): Promise<boolean> {
+  // Filter to only blocks with metric analysis IDs
+  const blocksWithMetricAnalysis = blocks.filter(
+    (block): block is MetricExplorerBlockInterface =>
+      blockHasFieldOfType(block, "metricAnalysisId", isString) &&
+      block.metricAnalysisId.length > 0,
+  );
+
+  // Process each block individually to use its specific analysisSettings
+  const results = await Promise.all(
+    blocksWithMetricAnalysis.map(async (block) => {
+      const metricAnalysis = await context.models.metricAnalysis.getById(
+        block.metricAnalysisId,
+      );
+
+      if (!metricAnalysis) {
+        return false;
+      }
+
+      const metric = await context.models.factMetrics.getById(
+        metricAnalysis.metric,
+      );
+
+      if (!metric) {
+        return false;
+      }
+
+      // Use the block's analysisSettings instead of the metricAnalysis.settings
+      // This ensures filters and other block-specific settings are preserved
+      const blockSettings = block.analysisSettings;
+      // Reset the stored dates based on the configured lookback days
+      const endDate = new Date();
+      const startDate = new Date();
+      startDate.setDate(endDate.getDate() - blockSettings.lookbackDays);
+
+      const settings: MetricAnalysisSettings = {
+        userIdType: blockSettings.userIdType,
+        lookbackDays: blockSettings.lookbackDays,
+        startDate,
+        endDate,
+        populationType: blockSettings.populationType,
+        populationId: blockSettings.populationId ?? null,
+        additionalNumeratorFilters: blockSettings.additionalNumeratorFilters,
+        additionalDenominatorFilters:
+          blockSettings.additionalDenominatorFilters,
+      };
+
+      const queryRunner = await createMetricAnalysis(
+        context,
+        metric,
+        settings,
+        "metric",
+        false,
+      );
+
+      // Mutate the block in place (same object reference as in original blocks array)
+      block.metricAnalysisId = queryRunner.model.id;
+      block.analysisSettings.startDate = startDate;
+      block.analysisSettings.endDate = endDate;
+
+      // Keep the compare-to-previous-period analysis in sync with the rolled
+      // window. The previous window is derived (never reserved) — an adjacent
+      // window of equal length immediately preceding the current one — so it
+      // rolls alongside the primary on every manual/scheduled refresh. Resolved
+      // through the shared seam so a future dashboard-wide compare toggle drives
+      // this the same way the per-block setting does.
+      //
+      // COST NOTE / revisit: this runs a second metric analysis per
+      // compare-enabled block, so a dashboard with N such blocks issues up to 2N
+      // analyses per refresh cycle. Fine today (they run concurrently via the
+      // Promise.all below), but if query costs run up — e.g. dashboards with many
+      // metric blocks on a tight updateSchedule — consider batching the current
+      // and previous windows into a single analysis/query instead of two.
+      if (resolveBlockComparison(block)?.enabled) {
+        const spanMs = endDate.getTime() - startDate.getTime();
+        const comparisonSettings: MetricAnalysisSettings = {
+          ...settings,
+          startDate: new Date(startDate.getTime() - spanMs),
+          endDate: startDate,
+        };
+        const comparisonQueryRunner = await createMetricAnalysis(
+          context,
+          metric,
+          comparisonSettings,
+          "metric",
+          false,
+        );
+        block.comparisonMetricAnalysisId = comparisonQueryRunner.model.id;
+      }
+
+      return true;
+    }),
+  );
+
+  return results.some((updated) => updated);
+}
+
+const PRODUCT_ANALYTICS_EXPLORATION_BLOCK_TYPES = [
+  "metric-exploration",
+  "fact-table-exploration",
+  "data-source-exploration",
+  "sql-exploration",
+  "funnel-exploration",
+] as const;
+
+type ProductAnalyticsExplorationBlock = Extract<
+  DashboardInterface["blocks"][number],
+  { type: (typeof PRODUCT_ANALYTICS_EXPLORATION_BLOCK_TYPES)[number] }
+>;
+
+/** An exploration type carrying a config. Its analysis id is what says run or already ran. */
+function isExplorationBlockWithConfig(block: { type: string }): boolean {
+  return (
+    PRODUCT_ANALYTICS_EXPLORATION_BLOCK_TYPES.includes(
+      block.type as (typeof PRODUCT_ANALYTICS_EXPLORATION_BLOCK_TYPES)[number],
+    ) && (block as { config?: unknown }).config != null
+  );
+}
+
+/** Empty means the block has no result yet, which is what says run it. */
+export function explorationAnalysisId(block: { type: string }): string {
+  return (block as { explorerAnalysisId?: string }).explorerAnalysisId ?? "";
+}
+
+function isProductAnalyticsExplorationBlock(
+  block: DashboardInterface["blocks"][number],
+): block is ProductAnalyticsExplorationBlock {
+  return isExplorationBlockWithConfig(block) && !!explorationAnalysisId(block);
+}
+
+/** Narrowed to what `getEffectiveExplorationConfig` reads. */
+type EffectiveConfigInput = Parameters<typeof getEffectiveExplorationConfig>[0];
+
+/** Runs blocks sent as a bare `config`. Throws: a new tile has no previous result to fall back on. */
+export async function runNewApiExplorationBlocks<
+  T extends { type: string; title: string },
+>(
+  context: ReqContext | ApiReqContext,
+  blocks: T[],
+  dashboard: Pick<DashboardInterface, "globalControls" | "comparison">,
+): Promise<DashboardBlockWithAnalysisId<T>[]> {
+  // In parallel: serial runs on a six-tile dashboard risk the request timing out.
+  return Promise.all(
+    blocks.map(async (block): Promise<DashboardBlockWithAnalysisId<T>> => {
+      // Casts: the conditional return type states what TS can't infer per branch.
+      if (!isExplorationBlockNeedingRun(block)) {
+        return block as DashboardBlockWithAnalysisId<T>;
+      }
+
+      // Enroll before querying, or the tile renders "click Update" forever.
+      const enrolled =
+        dashboard.globalControls?.dateRange &&
+        block.globalControlSettings?.dateRange === undefined
+          ? {
+              ...block,
+              globalControlSettings: {
+                ...block.globalControlSettings,
+                dateRange: true,
+              },
+            }
+          : block;
+
+      // Reads only type/config/globalControlSettings; a create block has no id.
+      const config = dashboard.globalControls
+        ? getEffectiveExplorationConfig(
+            enrolled as unknown as EffectiveConfigInput,
+            dashboard,
+          )
+        : block.config;
+      // Dashboard-wide wins over the block's own — the precedence tiles render under.
+      const comparison = resolveBlockComparison(block, dashboard);
+
+      // Never cached: a fuzzy hit stores a dateRange the tile reads as stale.
+      const exploration = await runProductAnalyticsExploration(
+        context,
+        config,
+        {
+          cache: "never",
+        },
+      );
+      if (!exploration) {
+        throw new BadRequestError(
+          `Could not run the query for "${block.title}". Check the block's datasource, metrics, and date range.`,
+        );
+      }
+      // A failed run still returns an exploration, so a truthy check alone saves
+      // a broken tile. `running` is legitimate — the sync budget — so only a
+      // reported error rejects, carrying the warehouse's own words.
+      if (exploration.status === "error") {
+        throw new BadRequestError(
+          `The query for "${block.title}" failed: ${
+            exploration.error || "no error reported"
+          }`,
+        );
+      }
+
+      const previous = comparison
+        ? await runProductAnalyticsExploration(
+            context,
+            buildComparisonExplorationConfig(
+              config,
+              resolveComparisonPreviousTimeFrame(config.dateRange, comparison),
+            ),
+            { cache: "never" },
+          )
+        : null;
+
+      // A failed comparison run is reported, not thrown, so an unchecked id
+      // here would save a broken previous-period series next to a good
+      // primary. Dropping it renders the tile without the comparison instead.
+      const previousId =
+        previous && previous.status !== "error" ? previous.id : undefined;
+      if (previous && !previousId) {
+        logger.warn(
+          { blockTitle: block.title, err: previous.error },
+          "Comparison query failed for a new dashboard block; saving without it",
+        );
+      }
+
+      return {
+        // Any comparison id the caller sent belongs to an earlier run, so only
+        // this run's may survive: dropped when the comparison failed and when
+        // it is now off, never carried over next to a fresh primary.
+        ...omit(enrolled, "comparisonExplorerAnalysisId"),
+        explorerAnalysisId: exploration.id,
+        ...(previousId ? { comparisonExplorerAnalysisId: previousId } : {}),
+      } as DashboardBlockWithAnalysisId<T>;
+    }),
+  );
+}
+
+/** Structural, not a union guard: covers both shapes, where the id is optional and required. */
+function isExplorationBlockNeedingRun<T extends { type: string }>(
+  block: T,
+): block is T & {
+  title: string;
+  config: ProductAnalyticsExplorationBlock["config"];
+  comparison?: ProductAnalyticsExplorationBlock["comparison"];
+  globalControlSettings?: { dateRange?: boolean };
+} {
+  return isExplorationBlockWithConfig(block) && !explorationAnalysisId(block);
+}
+
+// Returns a boolean indicating whether the blocks have been modified and will need to be saved to db
+export async function updateDashboardExplorations(
+  context: ReqContext | ApiReqContext,
+  blocks: DashboardInterface["blocks"],
+  // Optional so the future dashboard-wide compare toggle can drive every block
+  // through resolveBlockComparison without changing this signature again.
+  dashboard?: Pick<DashboardInterface, "globalControls" | "comparison">,
+): Promise<boolean> {
+  const explorationBlocks = blocks.filter(isProductAnalyticsExplorationBlock);
+  if (explorationBlocks.length === 0) return false;
+
+  let anyUpdated = false;
+  for (const block of explorationBlocks) {
+    try {
+      // Re-resolve the comparison every refresh so predefined previous windows
+      // roll forward with the primary range (custom windows stay fixed).
+      const comparison = resolveBlockComparison(block, dashboard);
+      const primaryConfig = dashboard
+        ? getEffectiveExplorationConfig(block, dashboard)
+        : block.config;
+      // allSettled (not all): a comparison failure (timeout, upstream schema
+      // change, transient warehouse issue) must not block the primary refresh
+      // and leave the whole block frozen at its last refresh.
+      const [primaryResult, comparisonResult] = await Promise.allSettled([
+        runProductAnalyticsExploration(context, primaryConfig, {
+          cache: "never",
+        }),
+        comparison
+          ? runProductAnalyticsExploration(
+              context,
+              buildComparisonExplorationConfig(
+                primaryConfig,
+                resolveComparisonPreviousTimeFrame(
+                  primaryConfig.dateRange,
+                  comparison,
+                ),
+              ),
+              { cache: "never" },
+            )
+          : Promise.resolve(null),
+      ]);
+      if (primaryResult.status === "rejected") {
+        throw primaryResult.reason;
+      }
+      // This should never happen when cache="never", but just in case
+      if (!primaryResult.value) {
+        throw new Error("Failed to run product analytics query");
+      }
+      // A failed run resolves rather than rejecting, so without this the block
+      // would point at a broken result and the refresh would report success.
+      if (primaryResult.value.status === "error") {
+        throw new Error(
+          primaryResult.value.error || "Product analytics query failed",
+        );
+      }
+      block.explorerAnalysisId = primaryResult.value.id;
+
+      const comparisonRun =
+        comparisonResult.status === "fulfilled" ? comparisonResult.value : null;
+      // Thrown and reported failures are the same outcome here: no usable
+      // previous-period run this cycle.
+      const comparisonFailure =
+        comparisonResult.status === "rejected"
+          ? comparisonResult.reason
+          : comparisonRun?.status === "error"
+            ? comparisonRun.error || "Product analytics query failed"
+            : undefined;
+      if (comparisonFailure) {
+        logger.warn(
+          {
+            err: comparisonFailure,
+            blockId: block.id,
+            blockType: block.type,
+          },
+          "Failed to refresh product analytics comparison; cleared the stale comparison",
+        );
+      }
+      if (comparisonRun && !comparisonFailure) {
+        block.comparisonExplorerAnalysisId = comparisonRun.id;
+      } else {
+        // Nothing usable, so leave no id behind — whether the comparison is now
+        // off or its run failed. The primary has just rolled to a new window, so
+        // a retained id is the window before the *old* primary: a plausible
+        // delta against the wrong baseline, worse than no comparison at all.
+        delete block.comparisonExplorerAnalysisId;
+      }
+      anyUpdated = true;
+    } catch (e) {
+      logger.warn(
+        { err: e, blockId: block.id, blockType: block.type },
+        "Failed to refresh product analytics exploration block",
+      );
+    }
+  }
+  return anyUpdated;
+}
+
+export async function updateDashboardSavedQueries(
+  context: ReqContext | ApiReqContext,
+  blocks: DashboardInterface["blocks"],
+) {
+  const savedQueries = await context.models.savedQueries.getByIds([
+    ...new Set(
+      blocks
+        .filter(
+          (
+            block,
+          ): block is Extract<
+            DashboardBlockInterface,
+            { savedQueryId: string }
+          > =>
+            blockHasFieldOfType(block, "savedQueryId", isString) &&
+            block.savedQueryId.length > 0,
+        )
+        .map((block) => block.savedQueryId),
+    ),
+  ]);
+
+  const datasourceIds: string[] = [
+    ...new Set<string>(savedQueries.map(({ datasourceId }) => datasourceId)),
+  ];
+  const datasources = await getDataSourcesByIds(context, datasourceIds);
+  const datasourceMap = new Map(datasources.map((ds) => [ds.id, ds]));
+
+  await Promise.all(
+    savedQueries.map(async (savedQuery) => {
+      const savedQueryDataSource = datasourceMap.get(savedQuery.datasourceId);
+      if (savedQueryDataSource) {
+        await executeAndSaveQuery(context, savedQuery, savedQueryDataSource);
+      }
+    }),
+  );
+}

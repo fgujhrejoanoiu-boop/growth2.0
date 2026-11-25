@@ -1,0 +1,22 @@
+.codeHolder {
+  margin: 0.5em 0;
+
+  &.collapsible pre {
+    transition: max-height 0.2s;
+    max-height: 60em;
+    overflow-y: scroll;
+  }
+
+  &.collapsed pre {
+    max-height: 10em;
+  }
+
+  pre {
+    margin: 0 !important;
+  }
+}
+
+.actionButtons {
+  border: 1px solid var(--slate-a4);
+  border-bottom: none;
+}

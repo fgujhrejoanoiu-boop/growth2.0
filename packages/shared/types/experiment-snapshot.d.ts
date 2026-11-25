@@ -1,0 +1,434 @@
+import { MidExperimentPowerCalculationResult } from "shared/enterprise";
+import { BanditResult } from "shared/validators";
+import { CovariateImbalanceResult } from "shared/health";
+import {
+  AnalysisKeyType,
+  AnalysisMetaEntry,
+} from "shared/snapshot-analysis-chunks";
+import {
+  MetricSettingsForStatsEngine,
+  QueryResultsForStatsEngine,
+  DifferenceType,
+  RiskType,
+  StatsEngine,
+  MetricPowerResponseFromStatsEngine,
+  RealizedSettings,
+  SupplementalResults,
+} from "shared/types/stats";
+import { QueryLanguage } from "./datasource";
+import { DimensionInterface } from "./dimension";
+import { MetricPriorSettings, MetricWindowSettings } from "./fact-table";
+import { MetricInterface, MetricStats } from "./metric";
+import { Queries } from "./query";
+import { PhaseSQLVar } from "./sql";
+import {
+  ExperimentReportResultDimension,
+  ExperimentReportVariation,
+  LegacyMetricRegressionAdjustmentStatus,
+} from "./report";
+import {
+  AttributionModel,
+  ExperimentInterfaceStringDates,
+  LegacyBanditResult,
+  LookbackOverride,
+} from "./experiment";
+
+export interface SnapshotMetric {
+  value: number;
+  cr: number;
+  users: number;
+  denominator?: number;
+  ci?: [number, number];
+  ciAdjusted?: [number, number];
+  expected?: number;
+  risk?: [number, number];
+  riskType?: RiskType;
+  stats?: MetricStats;
+  pValue?: number;
+  pValueAdjusted?: number;
+  uplift?: {
+    dist: string;
+    mean?: number;
+    stddev?: number;
+  };
+  buckets?: {
+    x: number;
+    y: number;
+  }[];
+  chanceToWin?: number;
+  errorMessage?: string;
+  computeFailed?: boolean;
+  power?: MetricPowerResponseFromStatsEngine;
+  realizedSettings?: RealizedSettings;
+  supplementalResults?: SupplementalResults;
+  /**
+   * Compound metrics, overall result only: units that matched each component
+   * at least once, in component order. Descriptive, no stats.
+   */
+  componentUnits?: number[];
+}
+
+export interface SnapshotVariation {
+  users: number;
+  metrics: {
+    [key: string]: SnapshotMetric;
+  };
+}
+
+export type LegacyExperimentSnapshotInterface = ExperimentSnapshotInterface & {
+  activationMetric?: string;
+  statsEngine?: StatsEngine;
+  hasRawQueries?: boolean;
+  hasCorrectedStats?: boolean;
+  results?: ExperimentReportResultDimension[];
+  regressionAdjustmentEnabled?: boolean;
+  metricRegressionAdjustmentStatuses?: LegacyMetricRegressionAdjustmentStatus[];
+  banditResult?: LegacyBanditResult;
+  sequentialTestingEnabled?: boolean;
+  sequentialTestingTuningParameter?: number;
+  queryFilter?: string;
+  segment?: string;
+  skipPartialData?: boolean;
+  manual: boolean;
+  query?: string;
+  queryLanguage?: QueryLanguage;
+};
+
+export interface MetricForSnapshot {
+  id: string;
+  /** Snapshot-time copy of the Metric object's settings. */
+  settings?: Pick<
+    MetricInterface,
+    | "datasource"
+    | "aggregation"
+    | "sql"
+    | "cappingSettings"
+    | "denominator"
+    | "userIdTypes"
+    | "type"
+  >;
+  /** Settings after overrides applied; see MetricSnapshotSettings. */
+  computedSettings?: {
+    regressionAdjustmentEnabled: boolean;
+    regressionAdjustmentAvailable: boolean;
+    regressionAdjustmentDays: number;
+    regressionAdjustmentReason: string;
+    properPrior: boolean;
+    properPriorMean: number;
+    properPriorStdDev: number;
+    windowSettings: MetricWindowSettings;
+    targetMDE?: number;
+  };
+}
+
+export interface DimensionForSnapshot {
+  /** Encodes type and id (e.g. `exp:country`, `pre:date`). */
+  id: string;
+  slices?: string[];
+  /** Snapshot-time settings, used by the front-end "out-of-date" warning. */
+  settings?: Pick<DimensionInterface, "datasource" | "userIdType" | "sql">;
+}
+export interface ExperimentSnapshotAnalysisSettings {
+  dimensions: string[];
+  statsEngine: StatsEngine;
+  regressionAdjusted?: boolean;
+  postStratificationEnabled?: boolean;
+  sequentialTesting?: boolean;
+  sequentialTestingTuningParameter?: number;
+  differenceType: DifferenceType;
+  pValueCorrection?: null | "holm-bonferroni" | "benjamini-hochberg";
+  pValueThreshold?: number;
+  baselineVariationIndex?: number;
+  numGoalMetrics: number;
+  numGuardrailMetrics: number;
+  oneSidedIntervals?: boolean;
+  holdoutAnalysisWindow?: {
+    start: Date;
+    end: Date;
+  };
+  useCovariateAsResponse?: boolean;
+}
+
+export type SnapshotType = "standard" | "exploratory" | "report";
+export type SnapshotQueryRunnerKind =
+  | "results"
+  | "incremental-full"
+  | "incremental-update"
+  | "incremental-exploratory";
+export type SnapshotTriggeredBy =
+  | "schedule"
+  | "manual"
+  | "manual-dashboard"
+  | "update-dashboards";
+
+export interface ExperimentSnapshotAnalysis {
+  // Stable per snapshot-analysis key used to identify the chunked row data
+  analysisKey: string;
+  // Determines which analysis this is
+  settings: ExperimentSnapshotAnalysisSettings;
+  dateCreated: Date;
+  status: "running" | "success" | "error";
+  error?: string;
+  results: ExperimentReportResultDimension[];
+}
+
+export interface SnapshotSettingsVariation {
+  id: string;
+  weight: number;
+}
+
+export interface SnapshotBanditSettings {
+  reweight: boolean;
+  decisionMetric: string;
+  seed: number;
+  currentWeights: number[];
+  historicalWeights: {
+    date: Date;
+    weights: number[];
+    totalUsers: number;
+  }[];
+  useFirstExposure?: boolean;
+  windowSettings?: MetricWindowSettings;
+  contextualBandit?: boolean;
+  targetingAttributeColumns?: string[];
+  periodWeighting?: boolean;
+}
+
+export interface ExperimentSnapshotSettings {
+  dimensions: DimensionForSnapshot[];
+  /** Always-computed unit dimensions gathered in 1 pass and split into per-dimension analyses. */
+  precomputedUnitDimensionIds?: string[];
+  metricSettings: MetricForSnapshot[];
+  goalMetrics: string[];
+  secondaryMetrics: string[];
+  guardrailMetrics: string[];
+  activationMetric: string | null;
+  defaultMetricPriorSettings: MetricPriorSettings;
+  regressionAdjustmentEnabled: boolean;
+  attributionModel: AttributionModel;
+  lookbackOverride?: LookbackOverride;
+  experimentId: string;
+  queryFilter: string;
+  segment: string;
+  skipPartialData: boolean;
+  datasourceId: string;
+  exposureQueryId: string;
+  exposureQueryIdentifierType?: string;
+  isClusterExperiment?: boolean;
+  clusterSubUnitIdentifier?: string;
+  /** Cluster experiment metrics joined on the cluster id instead of the sub-unit. */
+  clusterLevelMetricIds?: string[];
+  startDate: Date;
+  endDate: Date;
+  phase?: PhaseSQLVar;
+  customFields?: Record<string, unknown>;
+  variations: SnapshotSettingsVariation[];
+  coverage?: number;
+  banditSettings?: SnapshotBanditSettings;
+  // A running phase analyzed through a scheduled update's cutoff: nothing after
+  // endDate is read, conversions included. Otherwise conversion windows extend
+  // past endDate.
+  endDateIsCutoff?: boolean;
+  // The instant the update was planned. Without a cutoff, skipPartialData
+  // counts metric conversion windows back from it. The units query reads the
+  // time its SQL is generated instead and keeps exposures up to the earlier of
+  // that and the end date, so an end date in the future makes it depend on that
+  // time. Absent on snapshots planned before it was stored.
+  plannedAt?: Date;
+  /** @deprecated */
+  manual?: boolean;
+}
+
+/**
+ * A new-metrics update: a complete Overall snapshot that copied a previous
+ * snapshot's finished queries and queried only `queriedMetricIds`, pinned to
+ * that snapshot's end date.
+ */
+export interface SnapshotNewMetricsUpdate {
+  kind: "new_metrics";
+  // The snapshot whose queries were copied and whose metric settings were kept.
+  parentSnapshotId: string;
+  // Experiment metric ids this run queried. Their slices and funnel steps
+  // were queried with them and are not listed.
+  queriedMetricIds: string[];
+  // How many new-metrics updates in a row end with this one, itself included.
+  // Missing on those stored before it was.
+  updatesInARow?: number;
+  // The full snapshot (not itself a new-metrics update) that the chain of
+  // new-metrics updates started from.
+  base: {
+    dateCreated: Date;
+    // The results endpoint reports it as the dateEnd.
+    runStarted: Date | null;
+    // Null when the base analyzed through its run time.
+    cutoffDate: Date | null;
+  };
+}
+
+/** Which metrics an update computed. Absent when it computed every metric. */
+export type ExperimentSnapshotUpdateScope = SnapshotNewMetricsUpdate;
+
+export type SnapshotUpdateScopeKind =
+  | "all_metrics"
+  | ExperimentSnapshotUpdateScope["kind"];
+
+export interface ExperimentSnapshotInterface {
+  // Fields that uniquely define the snapshot
+  id: string;
+  organization: string;
+  experiment: string;
+  phase: number;
+  dimension: string | null;
+
+  // Status and meta info about the snapshot run
+  error?: string;
+  dateCreated: Date;
+  // For incremental-pipeline exploratory snapshots as their analysis
+  // is built on top of the overall results snapshot
+  sourceSnapshotId?: string;
+  sourceSnapshotDateCreated?: Date;
+  // Where the source's incremental metric scan stopped
+  sourceSnapshotEndDate?: Date;
+  runStarted: Date | null;
+  status: "running" | "success" | "error";
+  settings: ExperimentSnapshotSettings;
+  type?: SnapshotType;
+  triggeredBy?: SnapshotTriggeredBy;
+  report?: string;
+  runnerKind?: SnapshotQueryRunnerKind;
+  updateScope?: ExperimentSnapshotUpdateScope;
+
+  // List of queries that were run as part of this snapshot
+  queries: Queries;
+
+  // Results
+  unknownVariations: string[];
+  multipleExposures: number;
+  analyses: ExperimentSnapshotAnalysis[];
+  hasChunkedAnalyses?: boolean;
+  // Keyed by `ExperimentSnapshotAnalysis.analysisKey`
+  chunkedAnalysesMeta?: Record<AnalysisKeyType, AnalysisMetaEntry>;
+  banditResult?: BanditResult;
+
+  health?: ExperimentSnapshotHealth;
+}
+
+export interface ExperimentWithSnapshot extends ExperimentInterfaceStringDates {
+  snapshot?: ExperimentSnapshotInterface;
+}
+
+/**
+ * Subset of `ExperimentSnapshotInterface` returned by the dedicated
+ * `GET /experiment/:id/snapshot-summary/:phase` endpoint. The endpoint only
+ * fetches top-level snapshot fields (no per-metric analysis chunks), so
+ * `analyses[].results` are not available here — only fields needed to
+ * render refresh status, queries, errors, and other top-level snapshot
+ * metadata. The narrow return type, not a runtime flag, encodes the "no
+ * per-metric results" contract.
+ */
+export type SnapshotStatusSummary = Pick<
+  ExperimentSnapshotInterface,
+  | "id"
+  | "status"
+  | "error"
+  | "queries"
+  | "runStarted"
+  | "dateCreated"
+  | "multipleExposures"
+  | "health"
+  | "banditResult"
+  | "type"
+  | "triggeredBy"
+  | "updateScope"
+>;
+
+export interface ExperimentSnapshotHealth {
+  traffic: ExperimentSnapshotTraffic;
+  /** Cluster experiments: traffic counted per cluster rather than per subunit. */
+  clusterTraffic?: ExperimentSnapshotTraffic;
+  clusterUnits?: ExperimentSnapshotClusterUnits;
+  clusterAssignment?: ExperimentSnapshotClusterAssignment;
+  clusterSubUnitMapping?: ExperimentSnapshotClusterSubUnitMapping;
+  subUnitMultipleExposures?: ExperimentSnapshotSubUnitMultipleExposures;
+  power?: MidExperimentPowerCalculationResult;
+  covariateImbalance?: CovariateImbalanceResult;
+}
+
+export interface ExperimentSnapshotClusterSubUnitMapping {
+  totalUnits: number;
+  multiClusterUnits: number;
+  error?: string;
+}
+
+export interface ExperimentSnapshotSubUnitMultipleExposures {
+  totalSubUnits: number;
+  multipleExposedSubUnits: number;
+  error?: string;
+}
+
+export interface ExperimentSnapshotClusterAssignment {
+  totalClusters: number;
+  mixedClusters: number;
+  error?: string;
+}
+
+export interface ExperimentSnapshotClusterUnits {
+  // Ordered largest-first; capped at the query's row limit.
+  clusters: ExperimentSnapshotClusterUnit[];
+  error?: string;
+}
+
+export interface ExperimentSnapshotClusterUnit {
+  id: string;
+  variation: number;
+  units: number;
+  pct: number;
+}
+
+export interface ExperimentSnapshotTraffic {
+  overall: ExperimentSnapshotTrafficDimension;
+  dimension: {
+    [dimension: string]: ExperimentSnapshotTrafficDimension[];
+  };
+  error?: "NO_ROWS_IN_UNIT_QUERY" | "TOO_MANY_ROWS" | string;
+  // Absent when the traffic query errored
+  multipleExposures?: number;
+}
+export interface ExperimentSnapshotTrafficDimension {
+  name: string;
+  srm: number;
+  variationUnits: number[];
+}
+
+// Params for gbstats
+export interface ExperimentMetricAnalysisParams {
+  id: string;
+
+  variations: ExperimentReportVariation[];
+  phaseLengthHours: number;
+  coverage: number;
+  isClusterExperiment?: boolean;
+
+  analyses: ExperimentSnapshotAnalysisSettings[];
+  banditSettings?: SnapshotBanditSettings;
+  metrics: Record<string, MetricSettingsForStatsEngine>;
+
+  queryResults: QueryResultsForStatsEngine[];
+}
+
+export type ExperimentMetricAnalysisContext = {
+  snapshotSettings: ExperimentSnapshotSettings;
+  organization: string;
+  snapshot: string;
+};
+
+export type ExperimentMetricAnalysisData = {
+  analysisObj: ExperimentSnapshotAnalysis;
+  unknownVariations: string[];
+};
+
+export type ExperimentAnalysisParamsContextData = {
+  params: ExperimentMetricAnalysisParams;
+  context: ExperimentMetricAnalysisContext;
+  data: ExperimentMetricAnalysisData;
+};

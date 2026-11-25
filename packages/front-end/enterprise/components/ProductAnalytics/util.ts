@@ -1,0 +1,1874 @@
+import {
+  FactMetricInterface,
+  FactTableDefinition,
+  RowFilter,
+} from "shared/types/fact-table";
+import type {
+  MetricValue,
+  FactTableValue,
+  DataSourceValue,
+  SqlValue,
+  PopulationValue,
+  ProductAnalyticsValue,
+  DatasetType,
+  ExplorationDataset,
+  ExplorationConfig,
+  FunnelStep,
+  FunnelDataset,
+  JourneyDataset,
+  JourneyStepGroup,
+  ExplorationDateRange,
+  ProductAnalyticsChartSettings,
+} from "shared/validators";
+import {
+  explorationConfigValidator,
+  explorationDateRangeValidator,
+  comparisonModeValidator,
+  ComparisonMode,
+  SqlDataset,
+  MAX_JOURNEY_STEP_COLUMNS,
+  datasetHasValues,
+  omitRenderOnlyFields,
+} from "shared/validators";
+import {
+  applyStepGroups,
+  isJourneyDatasetRunnable,
+  stepGroupsForColumn,
+} from "shared/journeys";
+import { isEqual, omit } from "lodash";
+import type { AIChatMention } from "shared/ai-chat";
+import { createParser } from "nuqs";
+import {
+  canInlineFilterColumn,
+  getInlineFilterPromptColumns,
+} from "shared/experiments";
+import {
+  encodeExplorationConfig,
+  decodeExplorationConfigJson,
+  calculateProductAnalyticsDateRange,
+  getValidDateGranularities,
+  mapDatabaseTypeToEnum,
+  hasTimestampColumn,
+  hasTimeAxis,
+  sanitizeDimensions,
+  getRelevantFactTableIds,
+  normalizeShowAs,
+  fillMissingUnits,
+} from "shared/enterprise";
+import type {
+  DimensionFactTable,
+  ResolvedGranularity,
+} from "shared/enterprise";
+import {
+  operatorLabelMap,
+  getColumnInfo,
+  isRowFilterComplete,
+} from "@/components/FactTables/rowFilterUtils";
+import { renumberStepNames } from "@/components/FactTables/funnelStepUpdates";
+export {
+  getAvailableDimensionColumns,
+  getRelevantFactTableIds,
+  getMetricMixClass,
+  getMaxDimensions,
+  getValidDateGranularities,
+  getShowAsChoice,
+  getEffectiveMetricValue,
+  getExplorationRenderOpts,
+  getDefaultValueAxisName,
+  getValueAxisName,
+  buildExplorationColumns,
+  getExplorationCellValue,
+  computeDimensionTotals,
+  sortExplorationRows,
+  fillMissingUnits,
+} from "shared/enterprise";
+export type { MetricMixClass, ExplorationColumn } from "shared/enterprise";
+export type RenderOpts = import("shared/enterprise").ExplorationRenderOpts;
+
+/** Explorer UI state: exploration config plus optional compare period (not on public API config). */
+export type ExplorerDraftConfig = ExplorationConfig & {
+  previousTimeFrame?: ExplorationDateRange;
+  comparisonMode?: ComparisonMode;
+};
+
+/**
+ * Converts an explorer draft into a config the API accepts. Drops the UI-only
+ * compare fields, and — for raw tables — the dimensions and values the draft
+ * keeps so switching back to a visualization is reversible. Raw tables return
+ * unaggregated rows, so the server rejects a config that still carries them.
+ * Axis labels are trimmed but never dropped: blank means the user hid the label.
+ */
+export function stripExplorerDraftFields(
+  config: ExplorerDraftConfig,
+): ExplorationConfig {
+  const {
+    previousTimeFrame: _,
+    comparisonMode: __,
+    chartSettings,
+    ...rest
+  } = config;
+
+  const stripped: ExplorationConfig =
+    rest.type === "sql" && rest.chartType === "rawTable"
+      ? {
+          ...rest,
+          dimensions: [],
+          dataset: { ...rest.dataset, values: [] },
+        }
+      : rest;
+
+  const cleanedChartSettings = cleanChartSettings(chartSettings);
+  return cleanedChartSettings
+    ? ({
+        ...stripped,
+        chartSettings: cleanedChartSettings,
+      } as ExplorationConfig)
+    : stripped;
+}
+
+export { mapDatabaseTypeToEnum };
+
+export const PA_AI_CHAT_INITIAL_MESSAGE_KEY = "pa-ai-chat-initial-message";
+export const PA_AI_CHAT_INITIAL_MODEL_KEY = "pa-ai-chat-initial-model";
+
+export interface PAInitialChatMessage {
+  text: string;
+  mentions: AIChatMention[];
+  /** Skills picked from the composer's `/` menu before the handoff. */
+  skills: string[];
+}
+
+export function takeInitialChatMessage(): PAInitialChatMessage | null {
+  const stored = sessionStorage.getItem(PA_AI_CHAT_INITIAL_MESSAGE_KEY);
+  if (!stored) return null;
+  sessionStorage.removeItem(PA_AI_CHAT_INITIAL_MESSAGE_KEY);
+
+  const parsed = parseInitialChatMessage(stored);
+  return parsed && parsed.text ? parsed : null;
+}
+
+export function parseInitialChatMessage(
+  stored: string,
+): PAInitialChatMessage | null {
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (parsed && typeof parsed === "object" && "text" in parsed) {
+      const { text, mentions, skills } = parsed as PAInitialChatMessage;
+      if (typeof text !== "string") return null;
+      return {
+        text: text.trim(),
+        mentions: Array.isArray(mentions) ? mentions : [],
+        skills: Array.isArray(skills) ? skills : [],
+      };
+    }
+    return typeof parsed === "string"
+      ? { text: parsed.trim(), mentions: [], skills: [] }
+      : null;
+  } catch {
+    return { text: stored.trim(), mentions: [], skills: [] };
+  }
+}
+
+// Backoff (ms) for polling a still-running exploration, mirroring the shared
+// RunQueriesButton cadence (2s → 20s). Returns 0 to stop after ~10 min.
+// Shared by the Explorer (ExplorerContext) and dashboard tiles.
+export function explorationPollDelayMs(elapsedSec: number): number {
+  if (elapsedSec < 10) return 2000;
+  if (elapsedSec < 30) return 3000;
+  if (elapsedSec < 60) return 5000;
+  if (elapsedSec < 300) return 10000;
+  if (elapsedSec < 600) return 20000;
+  return 0;
+}
+
+export const VALUE_TYPE_OPTIONS: {
+  value: "unit_count" | "count" | "sum";
+  label: string;
+}[] = [
+  { value: "count", label: "Row count" },
+  { value: "unit_count", label: "Unit count" },
+  { value: "sum", label: "Sum" },
+];
+
+const COMMON_TIMESTAMP_COLUMNS = new Set([
+  "timestamp",
+  "created_at",
+  "updated_at",
+  "event_time",
+  "time",
+  "datetime",
+  "date",
+  "event_timestamp",
+  "ts",
+  "event_date",
+]);
+
+export function getValueTypeLabel(
+  valueType: "count" | "unit_count" | "sum",
+): string {
+  return (
+    VALUE_TYPE_OPTIONS.find((o) => o.value === valueType)?.label ?? valueType
+  );
+}
+
+export function getAlwaysInlineFilterColumns(
+  factTable: FactTableDefinition,
+): string[] {
+  return factTable.columns
+    .filter(
+      (c) => c.alwaysInlineFilter && canInlineFilterColumn(factTable, c.column),
+    )
+    .map((c) => c.column);
+}
+
+/** Always-filter string columns (event_name, path, …) are the step identity. */
+export function getDefaultJourneyStepColumns(
+  factTable: FactTableDefinition,
+): string[] {
+  const userIdTypes = new Set(factTable.userIdTypes ?? []);
+  const byName = new Map(factTable.columns.map((c) => [c.column, c]));
+  return getAlwaysInlineFilterColumns(factTable)
+    .filter((column) => {
+      const col = byName.get(column);
+      return col?.datatype === "string" && !userIdTypes.has(column);
+    })
+    .slice(0, MAX_JOURNEY_STEP_COLUMNS);
+}
+
+/** Re-point the anchor at grouped labels so it still matches after a rule
+ *  change; the drilled path can't survive a regrouping, so it resets. */
+export function withStepGroupsApplied(
+  current: JourneyDataset,
+  stepGroups: JourneyStepGroup[],
+): JourneyDataset {
+  return {
+    ...current,
+    stepGroups,
+    anchorStepValues:
+      current.anchorStepValues?.map((value, i) => {
+        const column = current.stepColumns[i];
+        if (!column || !value) return value;
+        return applyStepGroups(value, stepGroupsForColumn(stepGroups, column));
+      }) ?? null,
+    path: [],
+  };
+}
+
+/** Returns rowFilters with empty placeholder entries appended for every
+ *  fact-table column that has `alwaysInlineFilter` enabled and isn't already
+ *  represented in the existing filters. Mirrors the behavior used when
+ *  authoring fact metrics — keeps the explorer consistent with metrics UX.
+ *  `excludeColumns` skips journey step columns. */
+export function getInitialInlineFilters(
+  factTable: FactTableDefinition,
+  existingRowFilters: RowFilter[] = [],
+  excludeColumns: string[] = [],
+): RowFilter[] {
+  const rowFilters = [...existingRowFilters];
+  const excluded = new Set(excludeColumns.filter(Boolean));
+  getInlineFilterPromptColumns(factTable, rowFilters).forEach((column) => {
+    if (excluded.has(column)) return;
+    if (!rowFilters.some((rf) => rf.column === column)) {
+      rowFilters.push({
+        column,
+        operator: "=",
+        values: [""],
+      });
+    }
+  });
+  return rowFilters;
+}
+
+/** A stable key for a column-based filter — identifies "the same predicate
+ *  shape" across steps (same column + same operator; values may differ).
+ *  Returns null for sql_expr / saved_filter, which don't carry an obvious
+ *  per-step "context" to factor out. */
+function filterCommonKey(f: RowFilter): string | null {
+  if (f.operator === "sql_expr" || f.operator === "saved_filter") return null;
+  if (!f.column) return null;
+  return `${f.column}|${f.operator}`;
+}
+
+/** Set of (column|operator) keys whose filters appear on every step. We use
+ *  this to strip universal context from per-step previews — if every step
+ *  filters on `event_name=…`, the column+operator becomes redundant noise
+ *  and we render just the matching values instead.
+ *
+ *  Only meaningful when ≥2 steps exist; with a single step "universal" is
+ *  trivially true for everything it has, and stripping would just hide
+ *  information that the user typed. */
+export function getCommonFunnelFilterKeys(steps: FunnelStep[]): Set<string> {
+  if (steps.length < 2) return new Set();
+  let candidates: Set<string> | null = null;
+  for (const step of steps) {
+    const stepKeys = new Set<string>();
+    for (const f of step.rowFilters) {
+      if (!isRowFilterComplete(f)) continue;
+      const key = filterCommonKey(f);
+      if (key) stepKeys.add(key);
+    }
+    if (candidates === null) {
+      candidates = stepKeys;
+    } else {
+      candidates = new Set([...candidates].filter((k) => stepKeys.has(k)));
+    }
+    if (candidates.size === 0) break;
+  }
+  return candidates ?? new Set();
+}
+
+function formatValuesOnly(filter: RowFilter): string {
+  const valueRequired = ![
+    "is_true",
+    "is_false",
+    "is_null",
+    "not_null",
+  ].includes(filter.operator);
+  if (!valueRequired) return ""; // value-less universal filters drop out entirely
+  const values = (filter.values ?? []).filter((v) => v !== "");
+  return values.length ? values.join(", ") : "…";
+}
+
+/** One-line, human-readable summary of a single row filter. Symbol operators
+ *  (`=`, `!=`, `<`, `<=`, `>`, `>=`) render with no surrounding whitespace
+ *  (e.g. `path=/search`); word operators keep the surrounding spaces. */
+export function formatFilterPreview(
+  filter: RowFilter,
+  factTable: FactTableDefinition | null,
+): string {
+  if (filter.operator === "sql_expr") return "SQL expr";
+  if (filter.operator === "saved_filter") {
+    const savedId = filter.values?.[0];
+    const saved = factTable?.filters?.find((sf) => sf.id === savedId);
+    return saved ? saved.name : "Saved Filter";
+  }
+  const colName =
+    factTable?.columns.find((c) => c.column === filter.column)?.name ||
+    filter.column ||
+    "?";
+  const op = operatorLabelMap[filter.operator] ?? filter.operator;
+  const valueRequired = ![
+    "is_true",
+    "is_false",
+    "is_null",
+    "not_null",
+  ].includes(filter.operator);
+  // Symbol-style operators (start with a non-letter) read better tight,
+  // matching how engineers write the predicate inline.
+  const isSymbolOp = !/^[a-zA-Z]/.test(op);
+  if (!valueRequired) {
+    return `${colName} ${op}`;
+  }
+  const values = (filter.values ?? []).filter((v) => v !== "");
+  const valueStr = values.length ? values.join(", ") : "…";
+  return isSymbolOp
+    ? `${colName}${op}${valueStr}`
+    : `${colName} ${op} ${valueStr}`;
+}
+
+/** Compose the collapsed/inline summary used for a funnel step. Joins the
+ *  fact-table label (when shown) with up to `maxFilters` filter previews
+ *  concatenated with ` AND `; additional filters surface as `+N more`.
+ *
+ *  When `allSteps` is supplied, filters whose `column+operator` appears on
+ *  every step have their `{column}{operator}` prefix stripped — the universal
+ *  context is implicit, and showing it on each step adds noise. Step-specific
+ *  filters still render with the full `{column}{operator}{value}`. */
+export function getFunnelStepPreview({
+  step,
+  factTable,
+  showFactTable,
+  maxFilters = 2,
+  allSteps,
+}: {
+  step: FunnelStep;
+  factTable: FactTableDefinition | null;
+  showFactTable: boolean;
+  maxFilters?: number;
+  allSteps?: FunnelStep[];
+}): string {
+  const factTableLabel = showFactTable
+    ? (factTable?.name ?? step.factTableId ?? "")
+    : "";
+  const complete = step.rowFilters.filter(isRowFilterComplete);
+  const commonKeys = allSteps
+    ? getCommonFunnelFilterKeys(allSteps)
+    : new Set<string>();
+  const rendered = complete.map((f) => {
+    const key = filterCommonKey(f);
+    if (key && commonKeys.has(key)) {
+      return formatValuesOnly(f);
+    }
+    return formatFilterPreview(f, factTable);
+  });
+  // Drop empties produced by value-less universal filters (e.g. every step
+  // has `path is_null` — there's nothing left to render for that filter).
+  const nonEmpty = rendered.filter((s) => s !== "");
+  const previewCount = Math.min(maxFilters, nonEmpty.length);
+  const previews = nonEmpty.slice(0, previewCount);
+  const remaining = nonEmpty.length - previewCount;
+  let filtersText = previews.join(" AND ");
+  if (remaining > 0) {
+    filtersText += `${previews.length ? " " : ""}+${remaining} more`;
+  }
+  return [factTableLabel, filtersText].filter(Boolean).join(" · ");
+}
+
+const DEFAULT_STEP_NAME_RE = /^Step \d+$/;
+
+/** Returns the human-friendly label for a funnel step. When the step name
+ *  still matches the autogenerated `Step N` pattern, we substitute the
+ *  filter preview so chart/table labels carry the actual semantics (e.g.
+ *  `event_name=Purchase`, or just `Purchase` when `event_name=…` is the
+ *  universal context across every step). Falls back to the literal name
+ *  when there's nothing to preview. */
+export function getFunnelStepDisplayLabel({
+  step,
+  factTable,
+  fallbackIndex,
+  allSteps,
+}: {
+  step: FunnelStep;
+  factTable: FactTableDefinition | null;
+  /** Zero-based step position; used to back-compute `Step N` when the name
+   *  has been edited to something empty/whitespace. */
+  fallbackIndex: number;
+  /** Pass the full steps array to enable common-prefix stripping. */
+  allSteps?: FunnelStep[];
+}): string {
+  const trimmed = step.name?.trim() ?? "";
+  const isAutoName = !trimmed || DEFAULT_STEP_NAME_RE.test(trimmed);
+  if (!isAutoName) return trimmed;
+  // For an auto-named step we prefer the filter preview; the fact-table
+  // segment would just repeat what the chart's funnel context already shows.
+  const preview = getFunnelStepPreview({
+    step,
+    factTable,
+    showFactTable: false,
+    allSteps,
+  });
+  return preview || trimmed || `Step ${fallbackIndex + 1}`;
+}
+
+export function createEmptyValue(type: DatasetType): ProductAnalyticsValue {
+  const base = {
+    name: "",
+    rowFilters: [],
+  };
+  switch (type) {
+    case "metric":
+      return {
+        ...base,
+        name: generateUniqueValueName("Metric", []),
+        type: "metric",
+        metricId: "",
+        unit: null,
+        denominatorUnit: null,
+      } as MetricValue;
+    case "fact_table":
+      return {
+        ...base,
+        name: "Count",
+        type: "fact_table",
+        valueType: "count",
+        valueColumn: null,
+        unit: null,
+      } as FactTableValue;
+    case "data_source":
+      return {
+        ...base,
+        name: "Count",
+        type: "data_source",
+        valueType: "count",
+        valueColumn: null,
+        unit: null,
+      } as DataSourceValue;
+    case "sql":
+      return {
+        ...base,
+        name: "Count",
+        type: "sql",
+        valueType: "count",
+        valueColumn: null,
+        unit: null,
+      } as SqlValue;
+    case "population":
+      return {
+        ...base,
+        name: generateUniqueValueName("Population", []),
+        type: "population",
+        unit: null,
+        source: { type: "factTable", factTableId: "" },
+      } as PopulationValue;
+    case "funnel":
+      // The funnel sidebar manages steps directly; nothing in the codebase
+      // should ask for a "value" on a funnel dataset.
+      throw new Error("Funnels do not use values");
+    case "journey":
+      throw new Error("User Journeys do not use values");
+    default:
+      throw new Error(`Invalid dataset type: ${type}`);
+  }
+}
+
+/** True when a SQL dataset has been tested but not yet configured to explore. */
+function isUnconfiguredSqlDataset(config: ExplorerDraftConfig): boolean {
+  if (config.dataset.type !== "sql") return false;
+  if (config.dataset.values.length > 0) return false;
+  return (
+    !!config.dataset.sql.trim() &&
+    Object.keys(config.dataset.columnTypes).length > 0
+  );
+}
+
+/** Default a tested SQL dataset to its unaggregated result table on first Explore entry. */
+export function withDefaultSqlRawTable(
+  config: ExplorerDraftConfig,
+): ExplorerDraftConfig {
+  if (!isUnconfiguredSqlDataset(config)) return config;
+
+  const {
+    previousTimeFrame: _,
+    comparisonMode: __,
+    ...withoutComparison
+  } = config;
+
+  return {
+    ...withoutComparison,
+    chartType: "rawTable",
+    dimensions: [],
+  } as ExplorerDraftConfig;
+}
+
+/**
+ * Run after inserting, moving, or deleting funnel steps:
+ * - renumbers default names
+ * - clears optional/conversion window on whichever step lands first
+ */
+export function normalizeFunnelStepOrder(steps: FunnelStep[]): FunnelStep[] {
+  return renumberStepNames(steps).map((step, i) =>
+    i === 0 && (step.optional || step.conversionWindow)
+      ? { ...step, optional: false, conversionWindow: null }
+      : step,
+  );
+}
+
+/** Builds an empty funnel step. `factTableId` is optional so the "Add step"
+ *  button can prefill from the previous step (the inherited default). */
+export function createEmptyFunnelStep({
+  name,
+  factTableId = "",
+}: {
+  name: string;
+  factTableId?: string;
+}): FunnelStep {
+  return {
+    name,
+    factTableId,
+    rowFilters: [],
+    optional: false,
+  };
+}
+
+/** Intersection of `userIdTypes` across every step's resolved fact table.
+ *  Empty if any step is missing a fact table or a table id cannot be resolved. */
+export function getFunnelUnitOptions(
+  dataset: FunnelDataset,
+  factTables: FactTableDefinition[],
+): string[] {
+  const factTablesForSteps = dataset.steps
+    .map((s) =>
+      s.factTableId
+        ? (factTables.find((ft) => ft.id === s.factTableId) ?? null)
+        : null,
+    )
+    .filter((ft): ft is FactTableDefinition => !!ft);
+  if (
+    !factTablesForSteps.length ||
+    factTablesForSteps.length < dataset.steps.length
+  ) {
+    return [];
+  }
+  return (
+    factTablesForSteps.reduce<string[] | null>((acc, ft) => {
+      const ids = ft.userIdTypes ?? [];
+      if (acc === null) return [...ids];
+      return acc.filter((id) => ids.includes(id));
+    }, null) ?? []
+  );
+}
+
+export function generateUniqueValueName(
+  baseName: string,
+  existingValues: ProductAnalyticsValue[],
+): string {
+  if (!baseName) return "";
+
+  const existingNames = new Set(existingValues.map((v) => v.name));
+
+  // If base name doesn't exist, use it as-is (no number)
+  if (!existingNames.has(baseName)) {
+    return baseName;
+  }
+
+  // If base name exists, start incrementing from 1
+  let i = 1;
+  while (existingNames.has(`${baseName} ${i}`)) {
+    i++;
+  }
+
+  return `${baseName} ${i}`;
+}
+
+export function createEmptyDataset(type: DatasetType): ExplorationDataset {
+  if (type === "metric") {
+    return { type, values: [] };
+  } else if (type === "fact_table") {
+    return { type, values: [], factTableId: null };
+  } else if (type === "data_source") {
+    return {
+      type,
+      values: [],
+      table: "",
+      path: "",
+      timestampColumn: "",
+      columnTypes: {},
+    };
+  } else if (type === "sql") {
+    return {
+      type,
+      values: [],
+      sql: "",
+      timestampColumn: null,
+      columnTypes: {},
+    };
+  } else if (type === "funnel") {
+    return {
+      type,
+      unit: null,
+      steps: [createEmptyFunnelStep({ name: "Step 1" })],
+    };
+  } else if (type === "journey") {
+    return {
+      type,
+      factTableId: null,
+      unit: null,
+      stepColumns: [],
+      anchorStepValues: null,
+      direction: "forward",
+      rowFilters: [],
+      path: [],
+      // Draw one frontier level, keep two more in hand so the first two
+      // drill-downs redraw from the cached result instead of re-querying.
+      lookaheadDepth: 3,
+      optionsPerStep: [],
+    };
+  } else {
+    throw new Error(`Invalid dataset type: ${type}`);
+  }
+}
+
+/** Cached top values for a column (not dimension-specific — also usable for
+ *  filtering UI); empty for data_source datasets, which have no cached
+ *  column metadata. */
+export function getColumnTopValues(
+  dataset: ExplorationDataset | null,
+  column: string | null,
+  getFactTableById: (id: string) => DimensionFactTable | null,
+  getFactMetricById: (id: string) => FactMetricInterface | null,
+): string[] {
+  if (!dataset || !column) return [];
+
+  if (dataset.type === "fact_table") {
+    const ft = getFactTableById(dataset.factTableId || "");
+    return ft ? getColumnInfo(ft, column).topValues : [];
+  }
+  if (dataset.type === "metric") {
+    const topValues = new Set<string>();
+    dataset.values.forEach((value) => {
+      const metric = getFactMetricById(value.metricId);
+      if (!metric) return;
+      // Both sides of a ratio metric can carry the column — a filter or
+      // breakdown value may only exist on the denominator's fact table.
+      const numeratorFt = metric.numerator
+        ? getFactTableById(metric.numerator.factTableId)
+        : null;
+      if (numeratorFt) {
+        getColumnInfo(numeratorFt, column).topValues.forEach((v) =>
+          topValues.add(v),
+        );
+      }
+      const denominatorFt = metric.denominator
+        ? getFactTableById(metric.denominator.factTableId)
+        : null;
+      if (denominatorFt) {
+        getColumnInfo(denominatorFt, column).topValues.forEach((v) =>
+          topValues.add(v),
+        );
+      }
+    });
+    return Array.from(topValues);
+  }
+  if (dataset.type === "funnel") {
+    const initialStep = dataset.steps[0];
+    const ft = initialStep?.factTableId
+      ? getFactTableById(initialStep.factTableId)
+      : null;
+    return ft ? getColumnInfo(ft, column).topValues : [];
+  }
+  if (dataset.type === "journey") {
+    const ft = dataset.factTableId
+      ? getFactTableById(dataset.factTableId)
+      : null;
+    return ft ? getColumnInfo(ft, column).topValues : [];
+  }
+
+  return [];
+}
+
+export function getInferredTimestampColumn(
+  columnTypes: Record<string, string>,
+): string | null {
+  // First priority: Find column with type "date"
+  const dateTypedColumn = Object.keys(columnTypes).find(
+    (key) => columnTypes[key] === "date",
+  );
+
+  if (dateTypedColumn) {
+    return dateTypedColumn;
+  }
+
+  // Second priority: Check common timestamp column names (case-insensitive)
+  const commonNameColumn = Object.keys(columnTypes).find((key) =>
+    COMMON_TIMESTAMP_COLUMNS.has(key.toLowerCase()),
+  );
+
+  return commonNameColumn || null;
+}
+
+/** Ensures that dimensions are valid and within the allowed number of dimensions for the dataset type.
+ *  Returns a new config with the allowed dimensions (same config object if no changes were made).
+ *  Thin wrapper around the shared `sanitizeDimensions` policy — the Explorer applies it silently
+ *  and discards the warnings; the AI agent (which calls `sanitizeDimensions` directly) surfaces them. */
+export function validateDimensions(
+  config: ExplorationConfig,
+  getFactTableById: (id: string) => DimensionFactTable | null,
+  getFactMetricById: (id: string) => FactMetricInterface | null,
+): ExplorationConfig {
+  const dateRange = calculateProductAnalyticsDateRange(config.dateRange);
+  const validGranularities = getValidDateGranularities(dateRange);
+  return sanitizeDimensions(
+    config,
+    getFactTableById,
+    getFactMetricById,
+    validGranularities,
+  ).config;
+}
+
+/**
+ * Composes the normalization pipeline applied to every draft config the
+ * Explorer produces or receives (a fresh mount, a manual edit, or definitions
+ * resolving after initial render): backfill missing units, normalize
+ * per-value `showAs`, and — once the full (jsonFields-complete) fact
+ * tables the dimensions depend on have loaded — sanitize the dimension list.
+ * Before that data is ready (e.g. at initial mount, where the full-fact-table
+ * resolver doesn't exist yet), pass `fullFactTablesLoadedFor: () => false` so
+ * dimensions are left untouched rather than incorrectly dropped for columns
+ * that just haven't resolved yet.
+ */
+export function normalizeExplorerDraft(
+  config: ExplorerDraftConfig,
+  helpers: {
+    getFactTableById: (id: string) => FactTableDefinition | null;
+    getFactMetricById: (id: string) => FactMetricInterface | null;
+    getFullFactTableById: (id: string) => DimensionFactTable | null;
+    fullFactTablesLoadedFor: (ids: string[]) => boolean;
+  },
+): ExplorerDraftConfig {
+  const {
+    getFactTableById,
+    getFactMetricById,
+    getFullFactTableById,
+    fullFactTablesLoadedFor,
+  } = helpers;
+  const withUnits = fillMissingUnits(
+    config,
+    getFactTableById,
+    getFactMetricById,
+  );
+  const showAsNormalized = normalizeTimelessSqlConfig(
+    normalizeShowAs(withUnits, getFactMetricById),
+  );
+  const ready = fullFactTablesLoadedFor(
+    getRelevantFactTableIds(showAsNormalized.dataset, getFactMetricById),
+  );
+  const validated = ready
+    ? validateDimensions(
+        showAsNormalized,
+        getFullFactTableById,
+        getFactMetricById,
+      )
+    : showAsNormalized;
+  return validated as ExplorerDraftConfig;
+}
+
+/** Removes incomplete (partially configured) row filters from a value. */
+function cleanRowFilters<T extends { rowFilters: RowFilter[] }>(value: T): T {
+  return {
+    ...value,
+    rowFilters: value.rowFilters.filter(isRowFilterComplete),
+  };
+}
+
+/** Removes incomplete (partially configured) inputs (values, filters) from a dataset. (e.g. sum values without a value column) */
+export function removeIncompleteInputs(
+  dataset: ExplorationDataset,
+): ExplorationDataset {
+  if (dataset.type === "metric") {
+    return {
+      ...dataset,
+      values: dataset.values.filter((v) => v.metricId).map(cleanRowFilters),
+    };
+  } else if (dataset.type === "fact_table") {
+    return {
+      ...dataset,
+      values: dataset.values
+        .filter((v) => {
+          if (v.valueType === "count" || v.valueType === "unit_count") {
+            return true;
+          }
+          return !!v.valueColumn;
+        })
+        .map(cleanRowFilters),
+    };
+  } else if (dataset.type === "data_source") {
+    return {
+      ...dataset,
+      values: dataset.values
+        .filter((v) => {
+          if (v.valueType === "count" || v.valueType === "unit_count") {
+            return true;
+          }
+          return !!v.valueColumn;
+        })
+        .map(cleanRowFilters),
+    };
+  } else if (dataset.type === "sql") {
+    return {
+      ...dataset,
+      values: dataset.values
+        .filter((v) => {
+          if (v.valueType === "count" || v.valueType === "unit_count") {
+            return true;
+          }
+          return !!v.valueColumn;
+        })
+        .map(cleanRowFilters),
+    };
+  } else if (dataset.type === "funnel") {
+    return {
+      ...dataset,
+      steps: dataset.steps.filter((s) => !!s.factTableId).map(cleanRowFilters),
+    };
+  } else if (dataset.type === "journey") {
+    return {
+      ...dataset,
+      ...cleanRowFilters(dataset),
+    };
+  }
+  return dataset;
+}
+
+function cleanChartSettings(
+  chartSettings: ProductAnalyticsChartSettings | undefined,
+): ProductAnalyticsChartSettings | undefined {
+  if (!chartSettings) return undefined;
+  const next: ProductAnalyticsChartSettings = {};
+  // Preserve empty strings: they mean "hide this label", not "use the default".
+  if (chartSettings.categoryAxisLabel !== undefined) {
+    next.categoryAxisLabel = chartSettings.categoryAxisLabel.trim();
+  }
+  if (chartSettings.valueAxisLabel !== undefined) {
+    next.valueAxisLabel = chartSettings.valueAxisLabel.trim();
+  }
+  // Only persist the non-default: anchored to zero is the default.
+  if (chartSettings.anchorYAxisToZero === false) {
+    next.anchorYAxisToZero = false;
+  }
+  return Object.keys(next).length ? next : undefined;
+}
+
+/** Dataset fields the inferred value-axis label depends on. */
+function getValueAxisLabelSource(config: ExplorerDraftConfig) {
+  const { dataset } = config;
+  if (!datasetHasValues(dataset)) {
+    return { type: dataset.type };
+  }
+  // Includes each value's `showAs`, which drives the "Total" / "Per unit" title.
+  return {
+    type: dataset.type,
+    values: dataset.values.map((v) => omit(v, ["name", "rowFilters"])),
+  };
+}
+
+/** Drop a custom value-axis label when the values it described have changed. */
+export function resetValueAxisLabelOnDatasetChange(
+  previous: ExplorerDraftConfig,
+  next: ExplorerDraftConfig,
+): ExplorerDraftConfig {
+  if (next.chartSettings?.valueAxisLabel === undefined) return next;
+  if (
+    isEqual(getValueAxisLabelSource(previous), getValueAxisLabelSource(next))
+  ) {
+    return next;
+  }
+  const chartSettings = omit(next.chartSettings, "valueAxisLabel");
+  return {
+    ...next,
+    chartSettings: Object.keys(chartSettings).length
+      ? chartSettings
+      : undefined,
+  };
+}
+
+/** Prepares a config for submission by removing incomplete inputs (values, filters) from the dataset. */
+export function cleanConfigForSubmission(
+  config: ExplorerDraftConfig,
+): ExplorationConfig {
+  const configWithoutPrevious = stripExplorerDraftFields(
+    normalizeTimelessSqlConfig(config),
+  );
+  const cleanedDataset = removeIncompleteInputs(configWithoutPrevious.dataset);
+  const cleanedDimensions = configWithoutPrevious.dimensions.filter((d) => {
+    if (d.dimensionType === "date" || d.dimensionType === "slice") return true;
+    return "column" in d && d.column !== null;
+  });
+  return {
+    ...configWithoutPrevious,
+    dataset: cleanedDataset,
+    dimensions: cleanedDimensions,
+  } as ExplorationConfig;
+}
+
+const TIMESERIES_CHART_TYPES: Set<string> = new Set([
+  "line",
+  "area",
+  "timeseries-table",
+]);
+const CUMULATIVE_CHART_TYPES: Set<string> = new Set([
+  "bar",
+  "stackedBar",
+  "stackedHorizontalBar",
+  "horizontalBar",
+  "bigNumber",
+  "table",
+]);
+
+export function isTimeSeriesChart(
+  chartType: ExplorationConfig["chartType"],
+): boolean {
+  return TIMESERIES_CHART_TYPES.has(chartType);
+}
+
+const TABLE_CHART_TYPES: Set<string> = new Set([
+  "table",
+  "timeseries-table",
+  "rawTable",
+]);
+
+export function isTableChartType(
+  chartType: string | null | undefined,
+): boolean {
+  return !!chartType && TABLE_CHART_TYPES.has(chartType);
+}
+
+export function isTimelessSqlExploration(
+  config: Pick<ExplorationConfig, "dataset">,
+): boolean {
+  return config.dataset.type === "sql" && !hasTimeAxis(config.dataset);
+}
+
+const DEFAULT_DATE_DIMENSION = {
+  dimensionType: "date" as const,
+  column: "date",
+  dateGranularity: "auto" as const,
+};
+
+/**
+ * Single policy for timestamp column changes: adding one defaults bar/table to
+ * a line chart with a date dimension; removing one drops time-series charts,
+ * date dimensions, and comparison windows.
+ */
+export function applyTimestampColumn<T extends ExplorerDraftConfig>(
+  config: T,
+  column: string | null,
+): T {
+  if (config.dataset.type !== "sql" && config.dataset.type !== "data_source") {
+    return config;
+  }
+  if (config.dataset.type === "data_source" && column === null) {
+    return config;
+  }
+
+  const hadTime = hasTimestampColumn(config.dataset.timestampColumn);
+  const hasTime = hasTimestampColumn(column);
+  const nextTimestamp =
+    config.dataset.type === "sql" && !hasTime ? null : column;
+
+  let chartType = config.chartType;
+  let dimensions = config.dimensions;
+
+  if (hasTime && !hadTime) {
+    if (chartType === "bar" || chartType === "table") {
+      chartType = "line";
+    }
+    if (
+      chartType !== "rawTable" &&
+      !dimensions.some((dimension) => dimension.dimensionType === "date")
+    ) {
+      dimensions = [DEFAULT_DATE_DIMENSION, ...dimensions];
+    }
+  } else if (!hasTime) {
+    if (isTimeSeriesChart(chartType)) {
+      chartType = "bar";
+    }
+    if (dimensions.some((dimension) => dimension.dimensionType === "date")) {
+      dimensions = dimensions.filter(
+        (dimension) => dimension.dimensionType !== "date",
+      );
+    }
+  }
+
+  const unchanged =
+    config.dataset.timestampColumn === nextTimestamp &&
+    chartType === config.chartType &&
+    dimensions === config.dimensions;
+
+  if (!hasTime) {
+    if (
+      unchanged &&
+      config.previousTimeFrame === undefined &&
+      config.comparisonMode === undefined
+    ) {
+      return config;
+    }
+    return {
+      ...stripExplorerDraftFields(config),
+      chartType,
+      dimensions,
+      dataset: { ...config.dataset, timestampColumn: nextTimestamp },
+    } as T;
+  }
+
+  if (unchanged) return config;
+
+  return {
+    ...config,
+    chartType,
+    dimensions,
+    dataset: { ...config.dataset, timestampColumn: nextTimestamp },
+  } as T;
+}
+
+export function normalizeTimelessSqlConfig(
+  config: ExplorerDraftConfig,
+): ExplorerDraftConfig {
+  if (!isTimelessSqlExploration(config)) return config;
+  return applyTimestampColumn(config, null);
+}
+
+/**
+ * Keep a still-valid manual timestamp pick. Re-infer when the previous column
+ * is gone or when date columns newly appear. Preserve explicit "None" only
+ * when date columns existed before and still exist.
+ */
+export function resolveSqlPreviewTimestamp({
+  previousTimestamp,
+  previousColumnTypes,
+  columnTypes,
+  inferredTimestamp,
+}: {
+  previousTimestamp: string | null;
+  previousColumnTypes: SqlDataset["columnTypes"];
+  columnTypes: SqlDataset["columnTypes"];
+  inferredTimestamp: string | null;
+}): string | null {
+  if (
+    hasTimestampColumn(previousTimestamp) &&
+    columnTypes[previousTimestamp] === "date"
+  ) {
+    return previousTimestamp;
+  }
+  const previouslyHadDates = Object.values(previousColumnTypes).some(
+    (type) => type === "date",
+  );
+  const nowHasDates = Object.values(columnTypes).some(
+    (type) => type === "date",
+  );
+  if (
+    !hasTimestampColumn(previousTimestamp) &&
+    previouslyHadDates &&
+    nowHasDates
+  ) {
+    return null;
+  }
+  return inferredTimestamp;
+}
+
+export function applySqlPreviewMetadata(
+  config: ExplorerDraftConfig,
+  sql: string,
+  columnTypes: SqlDataset["columnTypes"],
+  inferredTimestamp: string | null,
+): ExplorerDraftConfig {
+  if (config.type !== "sql") return config;
+  const valueColumns = new Set(Object.keys(columnTypes));
+  const nextTimestamp = resolveSqlPreviewTimestamp({
+    previousTimestamp: config.dataset.timestampColumn,
+    previousColumnTypes: config.dataset.columnTypes,
+    columnTypes,
+    inferredTimestamp,
+  });
+  const dimensions = config.dimensions.filter(
+    (dimension) =>
+      dimension.dimensionType !== "dynamic" ||
+      dimension.column === null ||
+      valueColumns.has(dimension.column),
+  );
+  const hiddenColumns = config.dataset.hiddenColumns?.filter((column) =>
+    valueColumns.has(column),
+  );
+  return applyTimestampColumn(
+    {
+      ...config,
+      dimensions,
+      dataset: {
+        ...config.dataset,
+        sql,
+        columnTypes,
+        // A query rewrite can leave every remaining column hidden; reset
+        // rather than render an empty table.
+        hiddenColumns:
+          hiddenColumns?.length === valueColumns.size ? [] : hiddenColumns,
+        values: config.dataset.values.map((value) => ({
+          ...value,
+          valueColumn:
+            value.valueColumn && valueColumns.has(value.valueColumn)
+              ? value.valueColumn
+              : null,
+        })),
+      },
+    },
+    nextTimestamp,
+  );
+}
+
+/** Returns the category of a chart type (timeseries or cumulative).
+ *  Used to determine if a fetch or local update is needed. */
+function getChartCategory(chartType: ExplorationConfig["chartType"]): string {
+  if (CUMULATIVE_CHART_TYPES.has(chartType)) return "cumulative";
+  if (TIMESERIES_CHART_TYPES.has(chartType)) return "timeseries";
+  if (chartType === "rawTable") return "results";
+  throw new Error(`Invalid chart type: ${chartType}`);
+}
+
+/** Strips fields that only affect rendering, not data fetching. */
+export function toFetchKey(
+  config: ExplorationConfig | ExplorerDraftConfig,
+): unknown {
+  const base =
+    "previousTimeFrame" in config || "comparisonMode" in config
+      ? stripExplorerDraftFields(config)
+      : config;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { showAs, chartSettings, ...rest } = base;
+  if (base.dataset.type === "sql" && base.chartType === "rawTable") {
+    return {
+      ...rest,
+      dateRange: isTimelessSqlExploration(base) ? null : base.dateRange,
+      chartType: getChartCategory(base.chartType),
+      dataset: omit(base.dataset, ["hiddenColumns", "values"]),
+      dimensions: [],
+    };
+  }
+  if (isTimelessSqlExploration(base) && base.dataset.type === "sql") {
+    return {
+      ...rest,
+      dateRange: null,
+      chartType: getChartCategory(base.chartType),
+      dataset: {
+        ...omit(base.dataset, "hiddenColumns"),
+        values: base.dataset.values.map(omitRenderOnlyFields),
+      },
+    };
+  }
+  if (base.dataset.type === "funnel") {
+    // yAxisScale only affects how counts are rendered (percent vs raw);
+    // same rows as chart-type-only changes — omit from the fetch identity.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { yAxisScale, ...funnelDatasetSansYAxis } = base.dataset;
+    return {
+      ...rest,
+      chartType: getChartCategory(base.chartType),
+      dataset: {
+        ...funnelDatasetSansYAxis,
+        steps: base.dataset.steps.map(
+          ({ name: _name, ...stepRest }) => stepRest,
+        ),
+      },
+    };
+  }
+  if (base.dataset.type === "journey") {
+    // heightScale only affects how columns are drawn.
+    return {
+      ...rest,
+      chartType: getChartCategory(base.chartType),
+      dataset: omit(base.dataset, "heightScale"),
+    };
+  }
+  return {
+    ...rest,
+    chartType: getChartCategory(base.chartType),
+    dataset: {
+      ...(base.dataset.type === "sql"
+        ? omit(base.dataset, "hiddenColumns")
+        : base.dataset),
+      values: base.dataset.values.map(omitRenderOnlyFields),
+    },
+  };
+}
+
+/** Chart actions must use the same journey that produced the visible results. */
+export function canInteractWithJourney(
+  draft: ExplorerDraftConfig,
+  submitted: ExplorerDraftConfig | null,
+  loading: boolean,
+): boolean {
+  return (
+    !loading &&
+    draft.type === "journey" &&
+    submitted?.type === "journey" &&
+    isEqual(
+      toFetchKey(cleanConfigForSubmission(draft)),
+      toFetchKey(cleanConfigForSubmission(submitted)),
+    )
+  );
+}
+
+/** True when the draft only changed the drilled journey path. */
+export function journeyDiffersOnlyByPath(
+  submitted: ExplorationConfig,
+  draft: ExplorationConfig,
+): boolean {
+  if (submitted.type !== "journey" || draft.type !== "journey") {
+    return false;
+  }
+  if (isEqual(submitted.dataset.path, draft.dataset.path)) return false;
+  return isEqual(
+    toFetchKey({
+      ...submitted,
+      dataset: { ...submitted.dataset, path: [] },
+    }),
+    toFetchKey({
+      ...draft,
+      dataset: { ...draft.dataset, path: [] },
+    }),
+  );
+}
+
+/** Returns true if any value/step targets a fact table whose `alwaysInlineFilter`
+ *  columns are auto-seeded into rowFilters but still left at an empty value.
+ *  We operate on the *raw* (uncleaned) config so we can see the placeholder
+ *  filter that cleanRowFilters would otherwise strip before submission. */
+export function hasUnsatisfiedInlineFilters(
+  rawConfig: ExplorationConfig,
+  getFactTableById: (id: string) => FactTableDefinition | null,
+): boolean {
+  const dataset = rawConfig?.dataset;
+  if (!dataset) return false;
+
+  const stepHasUnsatisfied = (
+    factTableId: string | null,
+    rowFilters: RowFilter[],
+    excludeColumns: string[] = [],
+  ): boolean => {
+    if (!factTableId) return false;
+    const ft = getFactTableById(factTableId);
+    if (!ft) return false;
+    const excluded = new Set(excludeColumns.filter(Boolean));
+    const inlineColumns = new Set(
+      getInlineFilterPromptColumns(ft, rowFilters).filter(
+        (c) => !excluded.has(c),
+      ),
+    );
+    if (inlineColumns.size === 0) return false;
+    return rowFilters.some(
+      (rf) =>
+        !!rf.column && inlineColumns.has(rf.column) && !isRowFilterComplete(rf),
+    );
+  };
+
+  if (dataset.type === "fact_table") {
+    return dataset.values.some((v) =>
+      stepHasUnsatisfied(dataset.factTableId, v.rowFilters),
+    );
+  }
+  if (dataset.type === "funnel") {
+    return dataset.steps.some((s) =>
+      stepHasUnsatisfied(s.factTableId || null, s.rowFilters),
+    );
+  }
+  if (dataset.type === "journey") {
+    return stepHasUnsatisfied(
+      dataset.factTableId,
+      dataset.rowFilters,
+      dataset.stepColumns,
+    );
+  }
+  return false;
+}
+
+/** Checks if a config is minimally complete in order to be submitted.
+ *  - metric/fact_table/data_source/sql: need at least 1 value
+ *  - fact_table: also needs a fact table id
+ *  - data_source: also needs a table + timestamp column
+ *  - funnel: needs ≥2 steps with fact tables, a `unit`, and the unit must
+ *    exist as a userIdType on every step's fact table.
+ */
+export function isSubmittableConfig(
+  cleanedConfig: ExplorationConfig,
+  getFactTableById?: (id: string) => FactTableDefinition | null,
+): boolean {
+  if (!cleanedConfig?.dataset) return false;
+
+  if (cleanedConfig.dataset.type === "funnel") {
+    const { unit, steps } = cleanedConfig.dataset;
+    if (!unit) return false;
+    if (!Array.isArray(steps) || steps.length < 2) return false;
+    if (!steps.every((s) => !!s.factTableId)) return false;
+    if (getFactTableById) {
+      // Every step's fact table must expose the funnel-level unit as a
+      // userIdType — otherwise per-user joins across steps are impossible.
+      // We block submission rather than silently returning empty results.
+      for (const step of steps) {
+        const ft = getFactTableById(step.factTableId);
+        if (!ft) return false;
+        if (!ft.userIdTypes?.includes(unit)) return false;
+      }
+    }
+  } else if (cleanedConfig.dataset.type === "journey") {
+    const dataset = cleanedConfig.dataset;
+    if (!isJourneyDatasetRunnable(dataset, cleanedConfig.dimensions[0])) {
+      return false;
+    }
+    if (getFactTableById && dataset.factTableId && dataset.unit) {
+      const ft = getFactTableById(dataset.factTableId);
+      if (!ft) return false;
+      if (!ft.userIdTypes?.includes(dataset.unit)) return false;
+    }
+  } else if (
+    cleanedConfig.dataset.type !== "sql" ||
+    cleanedConfig.chartType !== "rawTable"
+  ) {
+    if (!Array.isArray(cleanedConfig.dataset.values)) return false;
+    if (cleanedConfig.dataset.values.length === 0) return false;
+    if (
+      cleanedConfig.dataset.type === "fact_table" &&
+      cleanedConfig.dataset.factTableId === null
+    )
+      return false;
+    if (
+      cleanedConfig.dataset.type === "data_source" &&
+      (!cleanedConfig.dataset.table ||
+        !hasTimestampColumn(cleanedConfig.dataset.timestampColumn))
+    )
+      return false;
+  }
+
+  if (cleanedConfig.dataset.type === "sql") {
+    const { sql, timestampColumn, columnTypes } = cleanedConfig.dataset;
+    const hasSql = sql.trim().length > 0;
+    const hasColumnTypes = Object.keys(columnTypes).length > 0;
+    const timestampIsDate =
+      !hasTimestampColumn(timestampColumn) ||
+      columnTypes[timestampColumn] === "date";
+    // Config is not submittable without sql, columns, or if timestamp column is not a date
+    if (!hasSql || !hasColumnTypes || !timestampIsDate) return false;
+  }
+
+  if (
+    cleanedConfig.dateRange.predefined === "customDateRange" &&
+    (!cleanedConfig.dateRange.startDate || !cleanedConfig.dateRange.endDate)
+  ) {
+    return false;
+  }
+
+  if (
+    cleanedConfig.dimensions.some(
+      (d) => d.dimensionType === "static" && d.values.length === 0,
+    )
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/** Compares two configs and determines if a fetch or local update is needed. */
+export function compareConfig(
+  lastSubmittedConfig: ExplorerDraftConfig | null,
+  newConfig: ExplorationConfig,
+  previousWindows?: {
+    lastPreviousTimeFrame: ExplorationDateRange | null;
+    newPreviousTimeFrame: ExplorationDateRange | null;
+    lastComparisonMode?: ComparisonMode | null;
+    newComparisonMode?: ComparisonMode | null;
+  },
+): { needsFetch: boolean; needsUpdate: boolean } {
+  const lastPrev = previousWindows?.lastPreviousTimeFrame ?? null;
+  const newPrev = previousWindows?.newPreviousTimeFrame ?? null;
+  // Two modes can resolve to the same window (e.g. a whole-week custom range
+  // under previousPeriod vs the weekday-matching variant). The mode still has to
+  // reach the server, which pairs rows differently for each.
+  const lastMode = previousWindows?.lastComparisonMode ?? null;
+  const newMode = previousWindows?.newComparisonMode ?? null;
+
+  if (!lastSubmittedConfig) {
+    // Placeholder seeds (e.g. default Count before a fact table / table is
+    // chosen) are not fetchable yet — don't treat them as pending changes.
+    const hasInputs = isSubmittableConfig(newConfig);
+    return { needsFetch: hasInputs, needsUpdate: hasInputs };
+  }
+
+  const lastComparable = stripExplorerDraftFields(lastSubmittedConfig);
+
+  if (
+    isEqual(lastComparable, newConfig) &&
+    isEqual(lastPrev, newPrev) &&
+    lastMode === newMode
+  ) {
+    return { needsFetch: false, needsUpdate: false };
+  }
+
+  const fetchKeyChanged =
+    !isEqual(toFetchKey(lastComparable), toFetchKey(newConfig)) ||
+    !isEqual(lastPrev, newPrev) ||
+    lastMode !== newMode;
+  return { needsFetch: fetchKeyChanged, needsUpdate: true };
+}
+
+export type { ResolvedGranularity } from "shared/enterprise";
+
+let cachedUsesHour12: boolean | null = null;
+/** Whether the browser's locale writes times on a 12-hour clock. */
+function usesHour12(): boolean {
+  cachedUsesHour12 ??=
+    new Intl.DateTimeFormat(undefined, { hour: "numeric" }).resolvedOptions()
+      .hour12 ?? false;
+  return cachedUsesHour12;
+}
+
+/**
+ * A date bucket's label. `timeZone`: "utc" shows warehouse dates (see
+ * parseWarehouseDate) unshifted; "local" is for buckets built in the browser.
+ *
+ * The default style is for tooltips and tables ("November 2026", "Week of Nov
+ * 2, 2026"). `compact` is for axis ticks: short months and no "Week of".
+ * `showYear: false` drops the year, except at year granularity.
+ */
+export function formatDateByGranularity(
+  date: Date,
+  granularity: ResolvedGranularity,
+  timeZone: "utc" | "local" = "utc",
+  {
+    compact = false,
+    showYear = true,
+  }: { compact?: boolean; showYear?: boolean } = {},
+): string {
+  const tz = timeZone === "utc" ? "UTC" : undefined;
+  const year = showYear ? { year: "numeric" as const } : {};
+  const month = compact ? ("short" as const) : ("long" as const);
+  switch (granularity) {
+    case "year":
+      return date.toLocaleDateString(undefined, {
+        year: "numeric",
+        timeZone: tz,
+      });
+    case "month":
+      return date.toLocaleDateString(undefined, {
+        ...year,
+        month,
+        timeZone: tz,
+      });
+    case "week": {
+      const start = date.toLocaleDateString(undefined, {
+        ...year,
+        month: "short",
+        day: "numeric",
+        timeZone: tz,
+      });
+      return compact ? start : `Week of ${start}`;
+    }
+    case "hour":
+      if (compact) {
+        // Hourly buckets always start on the hour, so 12-hour locales drop the
+        // minutes ("Jul 25, 9 AM"); 24-hour ones keep them ("25 Jul, 09:00"),
+        // where a bare "09" would read oddly.
+        return date.toLocaleString(undefined, {
+          ...year,
+          month,
+          day: "numeric",
+          hour: "numeric",
+          ...(usesHour12() ? {} : { minute: "2-digit" as const }),
+          timeZone: tz,
+        });
+      }
+      return `${date.toLocaleDateString(undefined, {
+        ...year,
+        month,
+        day: "numeric",
+        timeZone: tz,
+      })} ${date.toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: tz,
+      })}`;
+    case "day":
+    default:
+      return date.toLocaleDateString(undefined, {
+        ...year,
+        month,
+        day: "numeric",
+        timeZone: tz,
+      });
+  }
+}
+
+/**
+ * How a result-table column displays its cells. Decided per column, never by
+ * sniffing a value: a year bucket "2026" and a count 2026 look identical.
+ */
+export type ExplorationTableColumnFormat =
+  | { type: "text" }
+  | { type: "number"; fractionDigits: number };
+
+/**
+ * The single place result-table cells become display strings. Rows hold
+ * export-ready values (labels as strings, quantities as numbers); this adds
+ * the on-screen-only concerns: thousands separators and aligned decimals.
+ */
+export function formatExplorationTableCell(
+  value: unknown,
+  format: ExplorationTableColumnFormat | undefined,
+): string {
+  if (value == null) return "";
+  if (
+    format?.type === "number" &&
+    typeof value === "number" &&
+    Number.isFinite(value)
+  ) {
+    return value.toLocaleString(undefined, {
+      minimumFractionDigits: format.fractionDigits,
+      maximumFractionDigits: format.fractionDigits,
+    });
+  }
+  return String(value);
+}
+
+/**
+ * Column formats for a result table. `textKeys` are label columns. Each group
+ * in `numberKeyGroups` shares one decimal count (two when any of its values
+ * has a fraction, otherwise none) so a column, or a current/previous pair,
+ * reads consistently.
+ */
+export function buildExplorationTableColumnFormats(
+  rowData: Record<string, unknown>[],
+  textKeys: string[],
+  numberKeyGroups: string[][],
+): Record<string, ExplorationTableColumnFormat> {
+  const formats: Record<string, ExplorationTableColumnFormat> = {};
+  for (const key of textKeys) formats[key] = { type: "text" };
+  for (const group of numberKeyGroups) {
+    const hasFraction = rowData.some((row) =>
+      group.some((key) => {
+        const v = row[key];
+        return (
+          typeof v === "number" && Number.isFinite(v) && !Number.isInteger(v)
+        );
+      }),
+    );
+    for (const key of group) {
+      formats[key] = { type: "number", fractionDigits: hasFraction ? 2 : 0 };
+    }
+  }
+  return formats;
+}
+
+/** Formats a millisecond duration as a compact "1m 23s" style string. */
+export function formatDurationMs(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const totalMin = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (totalMin < 60) {
+    return sec ? `${totalMin}m ${sec}s` : `${totalMin}m`;
+  }
+  const totalHr = Math.floor(totalMin / 60);
+  const min = totalMin % 60;
+  if (totalHr < 24) {
+    return min ? `${totalHr}h ${min}m` : `${totalHr}h`;
+  }
+  const days = Math.floor(totalHr / 24);
+  const hr = totalHr % 24;
+  return hr ? `${days}d ${hr}h` : `${days}d`;
+}
+
+type FunnelCounts = { counts: number[] };
+
+// Share of step-1 users who reached `stepIdx`; null when step 1 is empty.
+export function fromStartRate(
+  s: FunnelCounts | undefined,
+  stepIdx: number,
+): number | null {
+  const first = s?.counts[0] ?? 0;
+  return first > 0 ? (s?.counts[stepIdx] ?? 0) / first : null;
+}
+
+// Share of the previous step's users who reached `stepIdx`.
+export function fromPrevRate(
+  s: FunnelCounts | undefined,
+  stepIdx: number,
+): number | null {
+  const prev = stepIdx > 0 ? (s?.counts[stepIdx - 1] ?? 0) : 0;
+  return prev > 0 ? (s?.counts[stepIdx] ?? 0) / prev : null;
+}
+
+// Rounds to 1 decimal; `|| 0` folds -0 into 0.
+export const round1 = (d: number) => Math.round(d * 10) / 10 || 0;
+
+// Funnel compare change for one bar:
+// - step 1: % change in users
+// - later steps: change in conversion from start, in pp
+export function stepChange(
+  cur: FunnelCounts,
+  prev: FunnelCounts | undefined,
+  stepIdx: number,
+): number | null {
+  if (stepIdx === 0) {
+    const p = prev?.counts[0] ?? 0;
+    return p > 0 ? round1(((cur.counts[0] ?? 0) / p - 1) * 100) : null;
+  }
+  const a = fromStartRate(cur, stepIdx);
+  const b = fromStartRate(prev, stepIdx);
+  return a === null || b === null ? null : round1((a - b) * 100);
+}
+
+export function getRefreshInterval(elapsedSeconds: number): number {
+  if (elapsedSeconds < 60) return 10_000; // 0-59s: update every 10s
+  if (elapsedSeconds < 3600) return 60_000; // 1-59m: update every 60s
+  if (elapsedSeconds < 86400) return 300_000; // 1-23h: update every 5m
+  return 900_000; // 24h+: update every 15m
+}
+
+/**
+ * True when a submitted state has enough inputs to render results. Used by
+ * the main section's empty-state guard. Funnels need ≥2 steps; other dataset
+ * types need ≥1 value. `cleanConfigForSubmission` is expected to have run
+ * already (we don't re-check completeness here). Acts as a type predicate
+ * so callers can pass the narrowed `ExplorationConfig` straight to children
+ * that require a non-null config.
+ */
+export function hasSubmittablePayload(
+  config: ExplorationConfig | null,
+): config is ExplorationConfig {
+  if (!config?.dataset) return false;
+  if (config.dataset.type === "funnel") {
+    return (config.dataset.steps?.length ?? 0) >= 2;
+  }
+  if (config.dataset.type === "journey") {
+    return isJourneyDatasetRunnable(config.dataset, config.dimensions[0]);
+  }
+  if (config.dataset.type === "sql" && config.chartType === "rawTable") {
+    return (
+      config.dataset.sql.trim().length > 0 &&
+      Object.keys(config.dataset.columnTypes).length > 0
+    );
+  }
+  return (config.dataset.values?.length ?? 0) > 0;
+}
+
+export function shouldChartSectionShow(params: {
+  loading: boolean;
+  error: string | null;
+  submittedExploreState: ExplorerDraftConfig | null;
+}): boolean {
+  const { loading, error, submittedExploreState } = params;
+
+  // Chart returns null when there's an error and we have SQL (error shown elsewhere)
+  if (!loading && error) return false;
+
+  // Chart renders empty box for table-only types; table view handles display
+  if (
+    submittedExploreState &&
+    isTableChartType(submittedExploreState.chartType)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+/** Which journey pane to show. Empty+error always opens Results / SQL;
+ *  empty without an error always stays on the visualization empty state. */
+export function journeyPreferredView({
+  chartType,
+  hasData,
+  hasError,
+}: {
+  chartType: string;
+  hasData: boolean;
+  hasError: boolean;
+}): "bar" | "table" {
+  if (!hasData && hasError) return "table";
+  if (!hasData && !hasError) return "bar";
+  return chartType === "table" ? "table" : "bar";
+}
+
+export type ExplorerEmptyState =
+  | "funnel-cta"
+  | "journey-loading"
+  | "journey-configure"
+  | "configure";
+
+export function explorerMainPresentation({
+  draftType,
+  chartType,
+  submitted,
+  hasChartData,
+  loading,
+  error,
+  isStale,
+  isSubmittable,
+}: {
+  draftType: ExplorationConfig["type"];
+  chartType: string;
+  submitted: ExplorerDraftConfig | null;
+  hasChartData: boolean;
+  loading: boolean;
+  error: string | null;
+  isStale: boolean;
+  isSubmittable: boolean;
+}): {
+  showChart: boolean;
+  showTable: boolean;
+  showStaleToast: boolean;
+  emptyState: ExplorerEmptyState | null;
+} {
+  const submittedEmpty = !hasSubmittablePayload(submitted);
+  if (submittedEmpty) {
+    const emptyState: ExplorerEmptyState =
+      draftType === "funnel"
+        ? "funnel-cta"
+        : draftType === "journey" && (loading || isSubmittable)
+          ? "journey-loading"
+          : draftType === "journey"
+            ? "journey-configure"
+            : "configure";
+    return {
+      showChart: false,
+      showTable: false,
+      showStaleToast: false,
+      emptyState,
+    };
+  }
+
+  const journeyView =
+    draftType === "journey"
+      ? journeyPreferredView({
+          chartType,
+          hasData: hasChartData,
+          hasError: !!error && !loading,
+        })
+      : null;
+  const showChart = journeyView
+    ? journeyView === "bar"
+    : shouldChartSectionShow({
+        loading,
+        error,
+        submittedExploreState: submitted,
+      });
+  const showTable = journeyView ? journeyView === "table" : true;
+  const showStaleToast = isStale || loading;
+
+  return { showChart, showTable, showStaleToast, emptyState: null };
+}
+
+export type DecodeConfigResult =
+  | { config: ExplorationConfig; error: null }
+  | { config: null; error: string };
+
+export function decodeExplorationConfig(encoded: string): DecodeConfigResult {
+  try {
+    const parsed = decodeExplorationConfigJson(encoded);
+    const config = explorationConfigValidator.parse(parsed);
+    return { config, error: null };
+  } catch {
+    return {
+      config: null,
+      error: "The URL contains an invalid or outdated explorer configuration.",
+    };
+  }
+}
+
+type DecodePreviousTimeFrameResult =
+  | { previousTimeFrame: ExplorationDateRange; error: null }
+  | { previousTimeFrame: null; error: string };
+
+function decodePreviousTimeFrameParam(
+  encoded: string,
+): DecodePreviousTimeFrameResult {
+  try {
+    const parsed = JSON.parse(decodeURIComponent(atob(encoded)));
+    const previousTimeFrame = explorationDateRangeValidator.parse(parsed);
+    return { previousTimeFrame, error: null };
+  } catch {
+    return {
+      previousTimeFrame: null,
+      error: "The URL contains an invalid comparison date range.",
+    };
+  }
+}
+
+export const explorationConfigParser = createParser<ExplorationConfig>({
+  parse: (raw) => {
+    const result = decodeExplorationConfig(raw);
+    return result.config;
+  },
+  serialize: (config) => encodeExplorationConfig(config),
+});
+
+function encodePreviousTimeFrameParam(value: ExplorationDateRange): string {
+  return btoa(encodeURIComponent(JSON.stringify(value)));
+}
+
+export const previousTimeFrameQueryParser =
+  createParser<ExplorationDateRange | null>({
+    parse: (raw) => {
+      if (!raw) return null;
+      const result = decodePreviousTimeFrameParam(raw);
+      return result.previousTimeFrame;
+    },
+    serialize: (value) => (value ? encodePreviousTimeFrameParam(value) : ""),
+  });
+
+// Kept as its own plain param rather than folded into the base64
+// previousTimeFrame payload, which would invalidate already-shared links.
+export const comparisonModeQueryParser = createParser<ComparisonMode | null>({
+  parse: (raw) => {
+    if (!raw) return null;
+    const result = comparisonModeValidator.safeParse(raw);
+    return result.success ? result.data : null;
+  },
+  serialize: (value) => value ?? "",
+});

@@ -1,0 +1,160 @@
+import {
+  ManagedBy,
+  SavedGroupFormat,
+  SdkPayloadSize,
+  SdkPayloadSizeLevel,
+} from "shared/validators";
+
+// GrowthBook Proxy
+export interface ProxyConnection {
+  enabled: boolean;
+  host: string;
+  hostExternal?: string;
+  signingKey: string;
+  connected: boolean;
+  version: string;
+  error: string;
+  lastError: Date | null;
+  /**
+   * Failed attempts in a row to send the payload to the proxy. Each push makes
+   * up to two attempts: the first request, and a retry 5 seconds later if that
+   * fails. Responses with status 413 and attempts that get no response aren't
+   * counted. The proxy is disabled when this reaches 10.
+   */
+  consecutiveFailures?: number;
+  /** When the proxy started failing. Cleared when a push succeeds. */
+  failingSince?: Date | null;
+  /** When the last failure alert was sent. Cleared when a push succeeds. */
+  failureAlertedAt?: Date | null;
+}
+
+export type EditSDKConnectionParams = {
+  name?: string;
+  languages?: SDKLanguage[];
+  sdkVersion?: string;
+  proxyEnabled?: boolean;
+  proxyHost?: string;
+  environment?: string;
+  projects?: string[];
+  encryptPayload?: boolean;
+  hashSecureAttributes?: boolean;
+  includeVisualExperiments?: boolean;
+  includeDraftExperiments?: boolean;
+  includeDraftExperimentRefs?: boolean;
+  includeExperimentNames?: boolean;
+  includeRedirectExperiments?: boolean;
+  includeRuleIds?: boolean;
+  includeProjectIdInMetadata?: boolean;
+  includeCustomFieldsInMetadata?: boolean;
+  allowedCustomFieldsInMetadata?: string[];
+  includeTagsInMetadata?: boolean;
+  includeExperimentScheduleInMetadata?: boolean;
+  remoteEvalEnabled?: boolean;
+  savedGroupReferencesEnabled?: boolean;
+  tracesEnabled?: boolean;
+  eventTracker?: string;
+  archived?: boolean;
+};
+export type CreateSDKConnectionParams = {
+  organization: string;
+  name?: string;
+  languages?: SDKLanguage[];
+  sdkVersion?: string;
+  proxyEnabled?: boolean;
+  proxyHost?: string;
+  environment: string;
+  projects: string[];
+  encryptPayload: boolean;
+  hashSecureAttributes: boolean;
+  includeVisualExperiments: boolean;
+  includeDraftExperiments: boolean;
+  includeDraftExperimentRefs?: boolean;
+  includeExperimentNames: boolean;
+  includeRedirectExperiments: boolean;
+  includeRuleIds: boolean;
+  includeProjectIdInMetadata: boolean;
+  includeCustomFieldsInMetadata: boolean;
+  allowedCustomFieldsInMetadata: string[];
+  includeTagsInMetadata: boolean;
+  includeExperimentScheduleInMetadata?: boolean;
+  remoteEvalEnabled?: boolean;
+  tracesEnabled?: boolean;
+  managedBy?: ManagedBy;
+};
+
+import { sdkLanguages } from "shared/constants";
+
+export type SDKLanguage = (typeof sdkLanguages)[number];
+
+export type { SavedGroupFormat };
+
+export interface SDKConnectionInterface {
+  id: string;
+  organization: string;
+  name: string;
+  eventTracker?: string;
+  dateCreated: Date;
+  dateUpdated: Date;
+
+  // The SDK languages being used (e.g. `javascript`). Ideally it should only have 1 language (previously we encouraged multiple)
+  languages: SDKLanguage[];
+  // The SDK version being used (e.g. `1.0.0`). Assumes a single language, otherwise should default to "0".
+  sdkVersion?: string;
+
+  // SDK payload settings
+  environment: string;
+  projects: string[];
+  encryptPayload: boolean;
+  encryptionKey: string;
+  hashSecureAttributes?: boolean;
+  includeVisualExperiments?: boolean;
+  includeDraftExperiments?: boolean;
+  includeDraftExperimentRefs?: boolean;
+  includeExperimentNames?: boolean;
+  includeRedirectExperiments?: boolean;
+  includeRuleIds?: boolean;
+  includeProjectIdInMetadata?: boolean;
+  includeCustomFieldsInMetadata?: boolean;
+  allowedCustomFieldsInMetadata?: string[];
+  includeTagsInMetadata?: boolean;
+  includeExperimentScheduleInMetadata?: boolean;
+  // Carry prerequisite features into this payload even when they target other
+  // projects. Absent = off; new connections are created with it on.
+  includeReferencedPrerequisites?: boolean;
+
+  // URL slug for fetching features from the API
+  key: string;
+
+  // Set to true when it's used for the first time
+  connected: boolean;
+  proxy: ProxyConnection;
+
+  remoteEvalEnabled?: boolean;
+  // Accepts OpenTelemetry traces sent with this connection's client key.
+  tracesEnabled?: boolean;
+  /**
+   * How Saved Groups are written into this connection's payload. Absent on
+   * connections created before the setting existed; `toInterface` derives it
+   * from `savedGroupReferencesEnabled` for those.
+   */
+  savedGroupFormat?: SavedGroupFormat;
+  /**
+   * @deprecated Superseded by `savedGroupFormat`. Still written and still
+   * accepted by the API so existing integrations keep working.
+   */
+  savedGroupReferencesEnabled?: boolean;
+  archived?: boolean;
+  managedBy?: ManagedBy;
+
+  // Size of the last payload built for this connection
+  payloadSize?: SdkPayloadSize;
+  // The level last announced by event and email, so only changes notify
+  notifiedPayloadSizeLevel?: SdkPayloadSizeLevel;
+}
+
+export interface ProxyTestResult {
+  status: number;
+  error: string;
+  version: string;
+  url: string;
+}

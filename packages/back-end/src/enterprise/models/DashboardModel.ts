@@ -1,0 +1,1327 @@
+import mongoose from "mongoose";
+import { v4 as uuidv4 } from "uuid";
+import uniqid from "uniqid";
+import { UpdateProps } from "shared/types/base-model";
+import { Permissions } from "shared/permissions";
+import { isString, PermissionError } from "shared/util";
+import {
+  ApiCreateDashboardBlockInterface,
+  ApiDashboardBlockInterface,
+  blockHasFieldOfType,
+  blockUsesDashboardDateControl,
+  resolveGlobalControlsBlockEnrollment,
+  dashboardBlockHasIds,
+  isDashboardBlockRef,
+  DashboardBlockRef,
+  apiCreateDashboardBody,
+  apiCreateDashboardBodyV2,
+  ApiCreateDashboardBody,
+  DashboardBlockWithAnalysisId,
+  ApiDashboardInterface,
+  ApiGetDashboardsForExperimentReturn,
+  apiUpdateDashboardBody,
+  ApiUpdateDashboardBody,
+  dashboardInterface,
+  DashboardInterface,
+  CreateDashboardBlockInterface,
+  DashboardBlockInterface,
+  LegacyDashboardBlockInterface,
+  convertPinnedSlicesToSliceTags,
+  isDifferenceType,
+  BlockLayout,
+  DASHBOARD_GRID_COLS,
+  getBlockSizeBounds,
+} from "shared/enterprise";
+import {
+  ExplorationDateRange,
+  defaultPrimaryKeyShape,
+} from "shared/validators";
+import omit from "lodash/omit";
+import isEqual from "lodash/isEqual";
+import { getValidDate } from "shared/dates";
+import {
+  MakeModelClass,
+  ScopedFilterQuery,
+} from "back-end/src/models/BaseModel";
+import { AnalyticsExplorationModel } from "back-end/src/models/AnalyticsExplorationModel";
+import { ProjectModel } from "back-end/src/models/ProjectModel";
+import { getUserPermissions } from "back-end/src/util/organization.util";
+import {
+  getCollection,
+  removeMongooseFields,
+  ToInterface,
+} from "back-end/src/util/mongo.util";
+import { defineCustomApiHandler } from "back-end/src/api/apiModelHandlers";
+import {
+  dashboardApiSpec,
+  createDashboardV2Endpoint,
+  getDashboardsForExperimentEndpoint,
+} from "back-end/src/api/specs/dashboard.spec";
+import { determineNextDate } from "back-end/src/services/experiments";
+import {
+  explorationAnalysisId,
+  runNewApiExplorationBlocks,
+  shouldRecalculateNextUpdate,
+  updateDashboardExplorations,
+} from "back-end/src/enterprise/services/dashboards";
+import { BadRequestError } from "back-end/src/util/errors";
+import {
+  resolveOwnerEmail,
+  resolveOwnerEmails,
+  resolveOwnerForCreate,
+  resolveOwnerToUserId,
+} from "back-end/src/services/owner";
+
+export type DashboardDocument = mongoose.Document & DashboardInterface;
+type LegacyDashboardDocument = Omit<
+  DashboardDocument,
+  "blocks" | "editLevel" | "shareLevel"
+> & {
+  blocks: LegacyDashboardBlockInterface[];
+  editLevel: "organization" | "private";
+  shareLevel?: DashboardInterface["shareLevel"];
+};
+type ApiUpdateDashboardBlock = NonNullable<
+  ApiUpdateDashboardBody["blocks"]
+>[number];
+
+const COLLECTION_NAME = "dashboards";
+const BaseClass = MakeModelClass({
+  schema: dashboardInterface,
+  collectionName: COLLECTION_NAME,
+  idPrefix: "dash_",
+  auditLog: {
+    entity: "dashboard",
+    createEvent: "dashboard.create",
+    updateEvent: "dashboard.update",
+    deleteEvent: "dashboard.delete",
+  },
+  globallyUniquePrimaryKeys: true,
+  additionalIndexes: [
+    { fields: { organization: 1, experimentId: 1 }, unique: false },
+  ],
+  baseQuery: {
+    isDefault: false,
+    isDeleted: false,
+  },
+  apiConfig: {
+    modelKey: "dashboards",
+    openApiSpec: dashboardApiSpec,
+    customHandlers: [
+      defineCustomApiHandler({
+        ...createDashboardV2Endpoint,
+        reqHandler: async (
+          req,
+        ): Promise<{ dashboard: ApiDashboardInterface }> => ({
+          dashboard: await req.context.models.dashboards.createFromApiV2(
+            req.body,
+          ),
+        }),
+      }),
+      defineCustomApiHandler({
+        ...getDashboardsForExperimentEndpoint,
+        reqHandler: async (
+          req,
+        ): Promise<ApiGetDashboardsForExperimentReturn> => ({
+          dashboards: await resolveOwnerEmails(
+            (
+              await req.context.models.dashboards.findByExperiment(
+                req.params.experimentId,
+              )
+            ).map(req.context.models.dashboards.toApiInterface),
+            req.context,
+          ),
+        }),
+      }),
+    ],
+  },
+});
+
+export const toInterface: ToInterface<DashboardInterface> = (doc) => {
+  const dashboard = removeMongooseFields(doc);
+  const cols = dashboard.grid?.cols ?? DASHBOARD_GRID_COLS;
+  dashboard.blocks = normalizeLayouts(
+    dashboard.blocks.map(blockToInterface),
+    cols,
+  );
+  return dashboard;
+};
+
+export class DashboardModel extends BaseClass {
+  public async findByExperiment(
+    experimentId: string,
+    additionalFilter: ScopedFilterQuery<
+      typeof dashboardInterface,
+      typeof defaultPrimaryKeyShape
+    > = {},
+  ): Promise<DashboardInterface[]> {
+    return this._find({ experimentId, ...additionalFilter });
+  }
+
+  public async getAllNonExperimentDashboards(): Promise<DashboardInterface[]> {
+    return this._find({ experimentId: null });
+  }
+
+  // Every dashboard in the org, ignoring the caller's read permissions. Only
+  // for authoritative dependency scans (e.g. blocking deletion of a fact table
+  // column a dashboard still references), where missing a dashboard the caller
+  // cannot read would let the delete through and leave that dashboard
+  // generating SQL for a column that no longer exists. Never return these to
+  // the caller.
+  public async dangerousGetAllForDependencyScan(): Promise<
+    DashboardInterface[]
+  > {
+    return this._find({}, { bypassReadPermissionChecks: true });
+  }
+
+  public static async getDashboardsToUpdate(): Promise<
+    Array<{
+      id: string;
+      organization: string;
+    }>
+  > {
+    const dashboards = await getCollection(COLLECTION_NAME)
+      .find({
+        isDeleted: false,
+        isDefault: false,
+        enableAutoUpdates: true,
+        experimentId: null,
+        $or: [
+          {
+            nextUpdate: {
+              $exists: true,
+              $lte: new Date(),
+            },
+          },
+          {
+            nextUpdate: {
+              $exists: false,
+            },
+          },
+        ],
+      })
+      .project({
+        id: true,
+        organization: true,
+      })
+      .limit(100)
+      .sort({ nextUpdate: 1 })
+      .toArray();
+    return dashboards.map(({ id, organization }) => ({ id, organization }));
+  }
+
+  protected canCreate(doc: DashboardInterface): boolean {
+    if (doc.experimentId) {
+      if (!this.context.hasPremiumFeature("dashboards")) {
+        throw new Error("Your plan does not support creating dashboards.");
+      }
+      const { experiment } = this.getForeignRefs(doc);
+      if (!experiment) {
+        throw new Error("Experiment not found.");
+      }
+      return this.context.permissions.canCreateReport(experiment);
+    } else {
+      if (!this.context.hasPremiumFeature("product-analytics-dashboards")) {
+        throw new Error("Your plan does not support creating dashboards.");
+      }
+      return this.context.permissions.canCreateGeneralDashboards(doc);
+    }
+  }
+
+  protected canRead(doc: DashboardInterface): boolean {
+    if (!this.context.permissions.canReadMultiProjectResource(doc.projects)) {
+      return false;
+    }
+
+    if (doc.shareLevel === "private" && doc.userId !== this.context.userId) {
+      return false;
+    }
+
+    return true;
+  }
+
+  protected canUpdate(
+    existing: DashboardInterface,
+    updates: UpdateProps<DashboardInterface>,
+  ): boolean {
+    const isOwner = this.context.userId === existing.userId;
+    const isAdmin = this.context.permissions.canSuperDeleteReport();
+    const canManageOwnerAndSharing = isOwner || isAdmin;
+
+    // Non-owners & non-admins can't update owner or sharing/edit levels for Dashboards
+    if (!canManageOwnerAndSharing) {
+      if ("userId" in updates && updates.userId !== existing.userId) {
+        throw new Error(
+          "You are not authorized to change the owner of this dashboard.",
+        );
+      }
+      if ("editLevel" in updates && updates.editLevel !== existing.editLevel) {
+        throw new Error(
+          "You are not authorized to change the sharing level of this dashboard.",
+        );
+      }
+      if (
+        "shareLevel" in updates &&
+        updates.shareLevel !== existing.shareLevel
+      ) {
+        throw new Error(
+          "You are not authorized to change the sharing level of this dashboard.",
+        );
+      }
+    }
+
+    if (existing.experimentId) {
+      // Check that the org has the commercial feature
+      if (!this.context.hasPremiumFeature("dashboards")) {
+        throw new Error("Your plan does not support updating dashboards.");
+      }
+
+      const { experiment } = this.getForeignRefs(existing);
+      if (!experiment) throw new Error("Experiment not found.");
+
+      // Check that the user has permission to update experiment reports
+      return this.context.permissions.canUpdateReport(experiment);
+    } else {
+      if (!this.context.hasPremiumFeature("product-analytics-dashboards")) {
+        throw new Error("Your plan does not support updating dashboards.");
+      }
+      return this.context.permissions.canUpdateGeneralDashboards(
+        existing,
+        updates,
+      );
+    }
+  }
+
+  protected canDelete(doc: DashboardInterface): boolean {
+    // A user must have the permission, and be the owner or an admin to delete a dashboard
+    const isOwner = this.context.userId === doc.userId;
+    const isAdmin = this.context.permissions.canManageOrgSettings();
+    if (!isOwner && !isAdmin) {
+      return false;
+    }
+    if (doc.experimentId) {
+      const { experiment } = this.getForeignRefs(doc);
+      if (!experiment) throw new Error("Experiment not found.");
+      return this.context.permissions.canDeleteReport(experiment);
+    } else {
+      return this.context.permissions.canDeleteGeneralDashboards(doc);
+    }
+  }
+
+  protected migrate(orig: LegacyDashboardDocument): DashboardInterface {
+    return toInterface({
+      ...orig,
+      blocks: orig.blocks.map(migrateBlock),
+      editLevel:
+        orig.editLevel === "organization" ? "published" : orig.editLevel,
+      shareLevel: orig.shareLevel || "private",
+      updateSchedule: orig.updateSchedule || undefined,
+    });
+  }
+
+  protected async customValidation(
+    toSave: DashboardDocument,
+    previousDoc?: DashboardDocument,
+  ) {
+    await this.assertOwnerCanManage(toSave, previousDoc);
+    if (toSave.experimentId) {
+      if (toSave.updateSchedule) {
+        throw new Error(
+          "Cannot specify an update schedule for experiment dashboards",
+        );
+      }
+    } else {
+      if (toSave.enableAutoUpdates && !toSave.updateSchedule) {
+        throw new Error(
+          "Must define an update schedule to enable auto updates",
+        );
+      }
+    }
+  }
+
+  // A private dashboard is readable only by its owner, so an owner who can't
+  // manage it leaves nobody able to edit, reassign or delete it.
+  private async assertOwnerCanManage(
+    dashboard: DashboardInterface,
+    previous?: DashboardInterface,
+  ) {
+    const { userId } = dashboard;
+    if (!userId || userId === this.context.userId) return;
+    if (previous && previous.userId === userId) return;
+    if (!(await this.ownerCanManage(dashboard))) {
+      throw new BadRequestError(
+        "The owner must be an organization member with permission to manage this dashboard.",
+      );
+    }
+  }
+
+  private async ownerCanManage(dashboard: DashboardInterface) {
+    const { org, teams } = this.context;
+    if (!org.members.some((m) => m.id === dashboard.userId)) return false;
+    const [[user], restrictedProjects] = await Promise.all([
+      this.context.getUsersByIds([dashboard.userId]),
+      ProjectModel.dangerousGetRestrictedProjectIds(org.id),
+    ]);
+    const owner = new Permissions(
+      getUserPermissions(
+        { id: dashboard.userId, superAdmin: user?.superAdmin },
+        org,
+        teams,
+        restrictedProjects,
+      ),
+    );
+    if (!owner.canReadMultiProjectResource(dashboard.projects)) return false;
+    if (dashboard.experimentId) {
+      const { experiment } = this.getForeignRefs(dashboard, false);
+      return !!experiment && owner.canCreateReport(experiment);
+    }
+    return owner.canCreateGeneralDashboards(dashboard);
+  }
+
+  protected async afterCreate(doc: DashboardDocument) {
+    const queryIdSet = getSavedQueryIds(doc);
+    for (const queryId of queryIdSet) {
+      await this.linkSavedQuery(queryId, doc);
+    }
+  }
+
+  protected async afterUpdate(
+    existing: DashboardDocument,
+    _updates: UpdateProps<DashboardDocument>,
+    newDoc: DashboardDocument,
+  ) {
+    const initialQueryIdSet = getSavedQueryIds(existing);
+    const finalQueryIdSet = getSavedQueryIds(newDoc);
+    for (const queryId of finalQueryIdSet) {
+      if (initialQueryIdSet.has(queryId)) continue;
+      await this.linkSavedQuery(queryId, newDoc);
+    }
+  }
+
+  protected async afterDelete(_doc: DashboardDocument) {}
+
+  protected async linkSavedQuery(queryId: string, doc: DashboardDocument) {
+    const savedQuery = await this.context.models.savedQueries.getById(queryId);
+    if (savedQuery) {
+      const linkedDashboardIds = savedQuery.linkedDashboardIds || [];
+      if (!linkedDashboardIds.includes(doc.id)) {
+        linkedDashboardIds.push(doc.id);
+        await this.context.models.savedQueries.updateById(queryId, {
+          linkedDashboardIds,
+        });
+      }
+    }
+  }
+
+  public async deleteById(id: string) {
+    const existing = await this.getById(id);
+    if (!existing) return;
+    await this._deleteOne(existing);
+    return existing;
+  }
+
+  // When duplicating a dashboard, we need to create a new instance of each saved query so changes in
+  // the new dashboard don't affect the existing one
+  protected async beforeCreate(doc: DashboardDocument) {
+    const savedQueryIds = new Set(
+      doc.blocks
+        .filter((block) => blockHasFieldOfType(block, "savedQueryId", isString))
+        .map(({ savedQueryId }) => savedQueryId),
+    );
+    const newIdMapping: Record<string, string> = {};
+    for (const oldId of savedQueryIds) {
+      const existing = await this.context.models.savedQueries.getById(oldId);
+      if (!existing) continue;
+      // Only duplicate the query if it's linked to an existing dashboard (i.e. not being created for this new dashboard)
+      if ((existing.linkedDashboardIds ?? []).some((dashId) => dashId)) {
+        const {
+          id: _i,
+          organization: _o,
+          dateCreated: _c,
+          dateUpdated: _u,
+          linkedDashboardIds: _l,
+          ...toCreate
+        } = existing;
+        const { id } = await this.context.models.savedQueries.create(toCreate);
+        newIdMapping[oldId] = id;
+      }
+    }
+    doc.blocks = normalizeLayouts(
+      doc.blocks.map((block) => {
+        if (!blockHasFieldOfType(block, "savedQueryId", isString)) return block;
+        return {
+          ...block,
+          savedQueryId: newIdMapping[block.savedQueryId] ?? block.savedQueryId,
+        };
+      }),
+      doc.grid?.cols,
+    );
+  }
+
+  protected async beforeUpdate(
+    existing: DashboardDocument,
+    updates: UpdateProps<DashboardDocument>,
+    _newDoc: DashboardDocument,
+  ) {
+    // Recalculate nextUpdate if auto-updates are enabled and schedule is being updated
+    if (updates.enableAutoUpdates === false) {
+      // Auto-updates being disabled - clear the nextUpdate
+      updates.nextUpdate = undefined;
+    } else if (shouldRecalculateNextUpdate(updates, existing)) {
+      // Recalculate nextUpdate based on the schedule
+      const schedule = updates.updateSchedule ?? existing.updateSchedule;
+      updates.nextUpdate = schedule
+        ? (determineNextDate(schedule) ?? undefined)
+        : undefined;
+    }
+    // Always clamp/fill in block layouts on write so the persisted state can
+    // never exceed grid bounds, regardless of which caller produced the update
+    if (updates.blocks) {
+      const cols =
+        updates.grid?.cols ?? existing.grid?.cols ?? DASHBOARD_GRID_COLS;
+      updates.blocks = normalizeLayouts(updates.blocks, cols);
+    }
+  }
+
+  public toApiInterface(dashboard: DashboardInterface): ApiDashboardInterface {
+    return {
+      ...removeMongooseFields(dashboard),
+      blocks: dashboard.blocks.map(toBlockApiInterface),
+      dateCreated: dashboard.dateCreated.toISOString(),
+      dateUpdated: dashboard.dateUpdated.toISOString(),
+      nextUpdate: dashboard.nextUpdate?.toISOString(),
+      lastUpdated: dashboard.lastUpdated?.toISOString(),
+      owner: dashboard.userId,
+    };
+  }
+
+  protected async processApiCreateBody(rawBody: unknown) {
+    return this.buildApiCreateDoc(
+      apiCreateDashboardBody.parse(rawBody),
+      this.context.actingUserId,
+    );
+  }
+
+  // Body `owner` wins over the caller; with none it falls back to the PAT
+  // user, and a secret key with neither is rejected.
+  public async createFromApiV2(
+    rawBody: unknown,
+  ): Promise<ApiDashboardInterface> {
+    const { owner, ...body } = apiCreateDashboardBodyV2.parse(rawBody);
+    const userId = await resolveOwnerForCreate(owner, this.context, {
+      strict: true,
+    });
+    return resolveOwnerEmail(
+      this.toApiInterface(
+        await this.create(await this.buildApiCreateDoc(body, userId)),
+      ),
+      this.context,
+    );
+  }
+
+  private async buildApiCreateDoc(
+    {
+      editLevel,
+      shareLevel,
+      enableAutoUpdates,
+      updateSchedule,
+      experimentId,
+      title,
+      projects,
+      globalControls,
+      comparison,
+      blocks,
+    }: ApiCreateDashboardBody,
+    userId: string,
+  ) {
+    const base = {
+      uid: uuidv4().replace(/-/g, ""), // TODO: Move to BaseModel
+      isDefault: false,
+      isDeleted: false,
+      userId,
+      editLevel,
+      shareLevel,
+      enableAutoUpdates,
+      updateSchedule,
+      experimentId: experimentId || undefined,
+      title,
+      projects,
+      globalControls,
+      comparison,
+    };
+    // create() enforces canCreate, but only after the block runs below have
+    // already billed warehouse queries and written exploration records. Same
+    // gate, moved ahead of the spend; the blocks play no part in it.
+    const toCheck: DashboardInterface = {
+      ...base,
+      organization: this.context.org.id,
+      blocks: [],
+      // Placeholders: canCreate reads experimentId, editLevel and projects,
+      // not the id or timestamps BaseModel assigns on the real write.
+      id: "",
+      dateCreated: new Date(),
+      dateUpdated: new Date(),
+    };
+    await this.assertApiWriteAllowed("create", toCheck, (dashboard) =>
+      this.canCreate(dashboard),
+    );
+    await this.assertOwnerCanManage(toCheck);
+    // A chart block can arrive as a config the caller never ran.
+    const ranBlocks = await runNewApiExplorationBlocks(this.context, blocks, {
+      globalControls,
+      comparison,
+    });
+    const createdBlocks = await Promise.all(
+      ranBlocks.map((blockData) =>
+        generateDashboardBlockIds(
+          this.context.org.id,
+          fromBlockApiInterface(blockData),
+        ),
+      ),
+    );
+    const blocksWithGlobalControls =
+      resolveGlobalControlsBlockEnrollment({
+        nextGlobalControls: globalControls,
+        nextBlocks: createdBlocks,
+      }) ?? createdBlocks;
+    return {
+      ...base,
+      blocks: normalizeLayouts(blocksWithGlobalControls),
+    };
+  }
+
+  /**
+   * Runs a canCreate/canUpdate gate before the expensive part of an API write.
+   * BaseModel checks it again on the real write — this only moves the refusal
+   * ahead of the warehouse queries a dashboard body can trigger.
+   */
+  private async assertApiWriteAllowed(
+    action: "create" | "update",
+    dashboard: DashboardInterface,
+    check: (dashboard: DashboardInterface) => boolean,
+  ): Promise<void> {
+    await this.populateForeignRefs([dashboard]);
+    if (!check(dashboard)) {
+      throw new PermissionError(
+        `You do not have access to ${action} this resource`,
+      );
+    }
+  }
+  public override async handleApiUpdate(
+    req: Parameters<InstanceType<typeof BaseClass>["handleApiUpdate"]>[0],
+  ): Promise<ApiDashboardInterface> {
+    const id = req.params.id;
+    const dashboard = await this.getById(id);
+    if (!dashboard) req.context.throwNotFoundError();
+
+    // Same reason as the create path: buildApiUpdates runs the caller's chart
+    // blocks, and updateById would only refuse afterwards. The block list plays
+    // no part in canUpdate. `owner` is resolved first because that check keys
+    // off the stored userId; omitting it leaves the stored owner alone.
+    const { owner, blocks, ...fields } = apiUpdateDashboardBody.parse(req.body);
+    const userId = await resolveOwnerToUserId(owner, this.context, {
+      strict: true,
+    });
+    const nonBlockUpdates: UpdateProps<DashboardInterface> = {
+      ...fields,
+      ...(userId !== undefined ? { userId } : {}),
+    };
+    await this.assertApiWriteAllowed("update", dashboard, (existing) =>
+      this.canUpdate(existing, nonBlockUpdates),
+    );
+    await this.assertOwnerCanManage(
+      { ...dashboard, ...nonBlockUpdates },
+      dashboard,
+    );
+
+    // After the permission check: this rejects an id the dashboard doesn't have,
+    // and a caller who may not write here should hear that before anything else.
+    const toUpdate = await this.buildApiUpdates(
+      nonBlockUpdates,
+      blocks && fillServerOwnedBlockKeys(blocks, dashboard.blocks),
+      dashboard,
+    );
+    // CAS on the doc we read above, not a fresh one: `toUpdate` carries a whole
+    // block list derived from that snapshot, and the warehouse queries in
+    // between take long enough for someone else to have edited the dashboard.
+    // A 409 telling the caller to re-read beats silently dropping their work.
+    return resolveOwnerEmail(
+      this.toApiInterface(await this.updateIfUnchanged(dashboard, toUpdate)),
+      this.context,
+    );
+  }
+  private async buildApiUpdates(
+    nonBlockUpdates: UpdateProps<DashboardInterface>,
+    blockUpdates: ApiUpdateDashboardBlock[] | undefined,
+    existingDashboard: DashboardInterface,
+  ) {
+    const updates: UpdateProps<DashboardInterface> = { ...nonBlockUpdates };
+    // Absent controls mean the saved ones still apply, so a partial update
+    // queries the window the tiles render under.
+    const nextControls = {
+      globalControls:
+        updates.globalControls ?? existingDashboard.globalControls,
+      comparison: updates.comparison ?? existingDashboard.comparison,
+    };
+    // Dashboard-wide controls decide the window a tile queries, so changing one
+    // makes every result the caller did not re-run itself stale. Only these
+    // reach a chart: `projects` and `experimentSearchString` filter experiment
+    // blocks, which hold no stored result to go stale.
+    const chartControls = (controls: DashboardInterface["globalControls"]) => ({
+      dateRange: controls?.dateRange,
+      dateGranularity: controls?.dateGranularity,
+    });
+    const dateControlsChanged =
+      updates.globalControls !== undefined &&
+      !isEqual(
+        chartControls(updates.globalControls),
+        chartControls(existingDashboard.globalControls),
+      );
+    const comparisonChanged =
+      updates.comparison !== undefined &&
+      !isEqual(updates.comparison, existingDashboard.comparison);
+    // Indices of blocks this request runs itself; the rest carry a saved result.
+    const freshlyRun = new Set<number>();
+    if (blockUpdates) {
+      // A ref names a saved block to carry through as-is: nothing to run, nothing
+      // to convert. Kept positionally so the list still defines order.
+      const savedById = new Map(
+        existingDashboard.blocks.map((block) => [block.id, block]),
+      );
+      const carried = new Map<number, DashboardBlockInterface>();
+      const toProcess: {
+        index: number;
+        block: Exclude<ApiUpdateDashboardBlock, DashboardBlockRef>;
+      }[] = [];
+      blockUpdates.forEach((block, index) => {
+        if (!isDashboardBlockRef(block)) {
+          toProcess.push({ index, block });
+          // No analysis id is what makes runNewApiExplorationBlocks run it.
+          if (!explorationAnalysisId(block)) freshlyRun.add(index);
+          return;
+        }
+        const saved = savedById.get(block.id);
+        if (!saved) {
+          throw new BadRequestError(
+            `No block "${block.id}" on this dashboard. Reference one it already has, or send the block in full to add it.`,
+          );
+        }
+        carried.set(index, saved);
+      });
+
+      const ranBlocks = await runNewApiExplorationBlocks(
+        this.context,
+        toProcess.map((entry) => entry.block),
+        nextControls,
+      );
+      const migratedBlocks = ranBlocks
+        .map(fromBlockApiInterface)
+        .map(migrateBlock);
+      const processed = await Promise.all(
+        migratedBlocks.map((blockData) =>
+          dashboardBlockHasIds(blockData)
+            ? blockData
+            : generateDashboardBlockIds(this.context.org.id, blockData),
+        ),
+      );
+      toProcess.forEach((entry, i) => carried.set(entry.index, processed[i]));
+      const createdBlocks = blockUpdates.map((_, index) => {
+        const block = carried.get(index);
+        if (!block) throw new Error("Unreachable: every block index resolved");
+        return block;
+      });
+      // Two entries resolving to the same block would save the dashboard with
+      // a duplicated id, which breaks layout and every later edit of either.
+      const seenIds = new Set<string>();
+      for (const block of createdBlocks) {
+        if (seenIds.has(block.id)) {
+          throw new BadRequestError(
+            `Block "${block.id}" is listed more than once. Reference each block at most once.`,
+          );
+        }
+        seenIds.add(block.id);
+      }
+      updates.blocks = normalizeLayouts(
+        resolveGlobalControlsBlockEnrollment({
+          existingGlobalControls: existingDashboard.globalControls,
+          nextGlobalControls: updates.globalControls,
+          nextBlocks: createdBlocks,
+        }) ?? createdBlocks,
+      );
+    } else {
+      const enrolledBlocks = resolveGlobalControlsBlockEnrollment({
+        existingGlobalControls: existingDashboard.globalControls,
+        nextGlobalControls: updates.globalControls,
+        existingBlocks: existingDashboard.blocks,
+      });
+      if (enrolledBlocks) updates.blocks = enrolledBlocks;
+    }
+
+    // Re-run the results the caller did not, so a control change lands the same
+    // way it does in the app instead of leaving tiles on the previous window.
+    if (dateControlsChanged || comparisonChanged) {
+      const blocks = (updates.blocks ?? existingDashboard.blocks).map(
+        (block) => ({ ...block }),
+      );
+      // A dashboard-wide comparison overrides each block's own, so it reaches
+      // every chart; the date range reaches only the ones enrolled in it.
+      const carried = blocks.filter(
+        (block, index) =>
+          !freshlyRun.has(index) &&
+          (comparisonChanged || blockUsesDashboardDateControl(block)),
+      );
+      if (carried.length) {
+        // Mutates in place, and logs rather than throws: one tile whose query
+        // fails must not lose the caller the rest of the update.
+        await updateDashboardExplorations(this.context, carried, nextControls);
+        updates.blocks = blocks;
+      }
+    }
+    return updates;
+  }
+}
+
+/**
+ * `uid` and `organization` belong to the server. A caller editing a saved block
+ * names it by `id` and sends the fields it means to change, so those two come
+ * from the saved block. Without them it reads as new and is given a fresh id,
+ * silently replacing the tile.
+ */
+function fillServerOwnedBlockKeys(
+  blocks: ApiUpdateDashboardBlock[],
+  savedBlocks: DashboardInterface["blocks"],
+): ApiUpdateDashboardBlock[] {
+  const savedById = new Map(savedBlocks.map((block) => [block.id, block]));
+  return blocks.map((block) => {
+    // A bare ref has no type and is carried as-is; a block with no id is new.
+    if (!("type" in block) || !("id" in block) || !block.id) return block;
+    const saved = savedById.get(block.id);
+    if (!saved) {
+      throw new BadRequestError(
+        `No block "${block.id}" on this dashboard. Reference one it already has, or send the block without an id to add it.`,
+      );
+    }
+    return { ...block, uid: saved.uid, organization: saved.organization };
+  });
+}
+
+function getSavedQueryIds(doc: DashboardDocument): Set<string> {
+  const queryIdSet = new Set<string>();
+  doc.blocks.forEach((block) => {
+    if (
+      blockHasFieldOfType(block, "savedQueryId", isString) &&
+      block.savedQueryId
+    ) {
+      queryIdSet.add(block.savedQueryId);
+    }
+  });
+  return queryIdSet;
+}
+
+export const blockToInterface: ToInterface<DashboardBlockInterface> = (doc) => {
+  return removeMongooseFields<DashboardBlockInterface>(doc);
+};
+
+export function generateDashboardBlockIds(
+  organization: string,
+  initialValue: CreateDashboardBlockInterface,
+): DashboardBlockInterface {
+  const block = {
+    ...initialValue,
+    organization,
+    id: uniqid("dshblk_"),
+    uid: uuidv4().replace(/-/g, ""),
+  };
+
+  return blockToInterface(block);
+}
+
+// Convert a legacy "Completed Experiments" preset ("30" | "60" | "90" | "180" |
+// "365" | "custom") into the Metric-Explorer ExplorationDateRange shape. Fixed
+// presets without a direct equivalent (60/180/365) fold into a Custom Lookback.
+function legacyPresetToExplorationDateRange(
+  preset: string,
+  startDate?: string,
+  endDate?: string,
+): ExplorationDateRange {
+  const toYmd = (iso?: string) =>
+    iso ? getValidDate(iso).toISOString().slice(0, 10) : undefined;
+  switch (preset) {
+    case "custom":
+      return {
+        predefined: "customDateRange",
+        startDate: toYmd(startDate),
+        endDate: toYmd(endDate),
+      };
+    case "7":
+      return { predefined: "last7Days" };
+    case "30":
+      return { predefined: "last30Days" };
+    case "90":
+      return { predefined: "last90Days" };
+    default: {
+      const days = parseInt(preset, 10);
+      if (!isNaN(days) && days > 0) {
+        return {
+          predefined: "customLookback",
+          lookbackValue: days,
+          lookbackUnit: "day",
+        };
+      }
+      return { predefined: "last90Days" };
+    }
+  }
+}
+
+// Rewrite a completed-experiments block's legacy string `dateRange` (+ optional
+// top-level startDate/endDate) into the ExplorationDateRange object. Already
+// migrated blocks (object dateRange) pass through unchanged.
+function migrateCompletedExperimentsDateRange(
+  doc:
+    | LegacyDashboardBlockInterface
+    | DashboardBlockInterface
+    | CreateDashboardBlockInterface,
+): DashboardBlockInterface | CreateDashboardBlockInterface {
+  const raw = doc as unknown as {
+    dateRange?: unknown;
+    startDate?: string;
+    endDate?: string;
+  };
+  if (raw.dateRange && typeof raw.dateRange === "object") {
+    return doc as DashboardBlockInterface | CreateDashboardBlockInterface;
+  }
+  const preset = typeof raw.dateRange === "string" ? raw.dateRange : "90";
+  const dateRange = legacyPresetToExplorationDateRange(
+    preset,
+    raw.startDate,
+    raw.endDate,
+  );
+  const copy: Record<string, unknown> = { ...(doc as Record<string, unknown>) };
+  delete copy.startDate;
+  delete copy.endDate;
+  copy.dateRange = dateRange;
+  return copy as unknown as
+    | DashboardBlockInterface
+    | CreateDashboardBlockInterface;
+}
+
+export function migrateBlock(
+  doc:
+    | LegacyDashboardBlockInterface
+    | DashboardBlockInterface
+    | CreateDashboardBlockInterface,
+): DashboardBlockInterface | CreateDashboardBlockInterface {
+  switch (doc.type) {
+    case "experiment-metric": {
+      // Check if this is a legacy block with metricSelector
+      const legacyDoc = doc as LegacyDashboardBlockInterface;
+      const metricSelector =
+        ("metricSelector" in legacyDoc ? legacyDoc.metricSelector : "custom") ??
+        "custom";
+
+      // Convert metricSelector to metricIds
+      const existingMetricIds = doc.metricIds ?? [];
+      const migratedMetricIds = [...existingMetricIds];
+      // Add selector ID to metricIds if it's not "custom"
+      if (metricSelector !== "custom") {
+        if (!migratedMetricIds.includes(metricSelector)) {
+          migratedMetricIds.unshift(metricSelector);
+        }
+      }
+
+      const sortByRaw =
+        "sortBy" in doc && typeof doc.sortBy === "string"
+          ? (doc.sortBy as string)
+          : null;
+      // Map legacy "custom" to "metrics", otherwise use the value if it's valid
+      const sortBy =
+        sortByRaw === "custom"
+          ? "metrics"
+          : sortByRaw === "metrics" ||
+              sortByRaw === "significance" ||
+              sortByRaw === "change"
+            ? sortByRaw
+            : null;
+      const sortDirection =
+        "sortDirection" in doc && typeof doc.sortDirection === "string"
+          ? doc.sortDirection
+          : null;
+      const pinnedSlices =
+        "pinnedMetricSlices" in doc && Array.isArray(doc.pinnedMetricSlices)
+          ? doc.pinnedMetricSlices
+          : [];
+      const sliceTagsFilter =
+        pinnedSlices.length > 0
+          ? convertPinnedSlicesToSliceTags(pinnedSlices)
+          : doc.sliceTagsFilter || [];
+      const metricTagFilter = doc.metricTagFilter || [];
+      return {
+        ...omit(doc, ["pinnedMetricSlices", "pinSource", "metricSelector"]),
+        metricIds: migratedMetricIds,
+        sliceTagsFilter,
+        metricTagFilter,
+        sortBy,
+        sortDirection,
+      } as DashboardBlockInterface | CreateDashboardBlockInterface;
+    }
+    case "experiment-dimension": {
+      // Check if this is a legacy block with metricSelector
+      const legacyDoc = doc as LegacyDashboardBlockInterface;
+      const dimensionMetricSelector =
+        ("metricSelector" in legacyDoc ? legacyDoc.metricSelector : "custom") ??
+        "custom";
+
+      // Convert metricSelector to metricIds
+      const existingMetricIds = doc.metricIds ?? [];
+      const migratedMetricIds = [...existingMetricIds];
+      // Add selector ID to metricIds if it's not "custom"
+      if (dimensionMetricSelector !== "custom") {
+        if (!migratedMetricIds.includes(dimensionMetricSelector)) {
+          migratedMetricIds.unshift(dimensionMetricSelector);
+        }
+      }
+
+      const metricTagFilter = doc.metricTagFilter || [];
+      const sortByRaw =
+        "sortBy" in doc && typeof doc.sortBy === "string"
+          ? (doc.sortBy as string)
+          : null;
+      // Map legacy "custom" to "metrics", otherwise use the value if it's valid
+      const sortBy =
+        sortByRaw === "custom"
+          ? "metrics"
+          : sortByRaw === "metrics" ||
+              sortByRaw === "significance" ||
+              sortByRaw === "change"
+            ? sortByRaw
+            : null;
+      const sortDirection =
+        "sortDirection" in doc && typeof doc.sortDirection === "string"
+          ? doc.sortDirection
+          : null;
+      return {
+        ...omit(doc, ["pinnedMetricSlices", "pinSource", "metricSelector"]),
+        metricIds: migratedMetricIds,
+        metricTagFilter,
+        sortBy,
+        sortDirection,
+      } as DashboardBlockInterface | CreateDashboardBlockInterface;
+    }
+    case "experiment-time-series": {
+      // Check if this is a legacy block with metricSelector
+      const legacyDoc = doc as LegacyDashboardBlockInterface;
+      const timeSeriesMetricSelector =
+        ("metricSelector" in legacyDoc ? legacyDoc.metricSelector : "custom") ??
+        "custom";
+
+      // Convert metricSelector to metricIds
+      const existingMetricIds = doc.metricId
+        ? [doc.metricId]
+        : (doc.metricIds ?? []);
+      const migratedMetricIds = [...existingMetricIds];
+      // Add selector ID to metricIds if it's not "custom"
+      if (timeSeriesMetricSelector !== "custom") {
+        if (!migratedMetricIds.includes(timeSeriesMetricSelector)) {
+          migratedMetricIds.unshift(timeSeriesMetricSelector);
+        }
+      }
+
+      const sortByRaw =
+        "sortBy" in doc && typeof doc.sortBy === "string"
+          ? (doc.sortBy as string)
+          : null;
+      // Map legacy "custom" to "metrics", otherwise use the value if it's valid
+      const sortBy =
+        sortByRaw === "custom"
+          ? "metrics"
+          : sortByRaw === "metrics" ||
+              sortByRaw === "significance" ||
+              sortByRaw === "change"
+            ? sortByRaw
+            : null;
+      const sortDirection =
+        "sortDirection" in doc && typeof doc.sortDirection === "string"
+          ? doc.sortDirection
+          : null;
+      const pinnedSlices =
+        "pinnedMetricSlices" in doc && Array.isArray(doc.pinnedMetricSlices)
+          ? doc.pinnedMetricSlices
+          : [];
+      const sliceTagsFilter =
+        pinnedSlices.length > 0
+          ? convertPinnedSlicesToSliceTags(pinnedSlices)
+          : doc.sliceTagsFilter || [];
+      const metricTagFilter = doc.metricTagFilter || [];
+      const differenceType =
+        "differenceType" in doc && isDifferenceType(doc.differenceType)
+          ? doc.differenceType
+          : "relative";
+      return {
+        ...omit(doc, [
+          "pinnedMetricSlices",
+          "pinSource",
+          "metricId",
+          "metricSelector",
+        ]),
+        metricIds: migratedMetricIds,
+        sliceTagsFilter,
+        metricTagFilter,
+        differenceType,
+        sortBy,
+        sortDirection,
+      } as DashboardBlockInterface | CreateDashboardBlockInterface;
+    }
+    case "experiment-description":
+      return {
+        ...doc,
+        type: "experiment-metadata",
+        showDescription: true,
+        showHypothesis: false,
+        showVariationImages: false,
+      };
+    case "experiment-hypothesis":
+      return {
+        ...doc,
+        type: "experiment-metadata",
+        showDescription: false,
+        showHypothesis: true,
+        showVariationImages: false,
+      };
+    case "experiment-variation-image":
+      return {
+        ...doc,
+        type: "experiment-metadata",
+        showDescription: false,
+        showHypothesis: false,
+        showVariationImages: true,
+      };
+    case "experiment-traffic-graph":
+      return {
+        ...doc,
+        type: "experiment-traffic",
+        showTable: false,
+        showTimeseries: true,
+      };
+    case "experiment-traffic-table":
+      return {
+        ...doc,
+        type: "experiment-traffic",
+        showTable: true,
+        showTimeseries: false,
+      };
+    case "sql-explorer": {
+      return {
+        ...doc,
+        blockConfig: doc.blockConfig ?? [],
+      };
+    }
+    case "metric-experiments": {
+      // Legacy blocks stored a single top-level startDate/endDate window (a
+      // Custom Date Range applied to phase end dates). Migrate it to the new
+      // `endDateRange` field and drop the deprecated keys.
+      const legacy = doc as {
+        startDate?: string;
+        endDate?: string;
+        projects?: string[];
+      };
+      const copy = { ...(doc as Record<string, unknown>) };
+      let changed = false;
+
+      if (legacy.startDate !== undefined || legacy.endDate !== undefined) {
+        delete copy.startDate;
+        delete copy.endDate;
+        const toYmd = (iso?: string) =>
+          iso ? getValidDate(iso).toISOString().slice(0, 10) : undefined;
+        copy.endDateRange = {
+          predefined: "customDateRange",
+          startDate: toYmd(legacy.startDate),
+          endDate: toYmd(legacy.endDate),
+        };
+        changed = true;
+      }
+
+      // Legacy blocks predate the `projects` field; default to all projects.
+      if (legacy.projects === undefined) {
+        copy.projects = [];
+        changed = true;
+      }
+
+      if (!changed) return doc;
+      return copy as unknown as
+        | DashboardBlockInterface
+        | CreateDashboardBlockInterface;
+    }
+    case "experiments-scaled-impact":
+    case "experiments-win-rate":
+    case "experiments-status": {
+      // Migrate the legacy string date range ("30"/"90"/"custom"…) to the
+      // Metric-Explorer-style ExplorationDateRange object.
+      const migrated = migrateCompletedExperimentsDateRange(doc);
+      // Team Velocity was renamed from "Experiment Status"; rewrite only the
+      // old default title so pre-existing blocks pick up the new name.
+      if (
+        migrated.type === "experiments-status" &&
+        migrated.title === "Experiment Status"
+      ) {
+        return { ...migrated, title: "Team Velocity" };
+      }
+      return migrated;
+    }
+    case "funnel-exploration": {
+      const steps = doc.config?.dataset?.steps;
+      if (Array.isArray(steps)) {
+        const needsMigration = steps.some(
+          (s: Record<string, unknown>) =>
+            "factTable" in s && !("factTableId" in s),
+        );
+        if (needsMigration) {
+          return {
+            ...doc,
+            config: {
+              ...doc.config,
+              dataset: {
+                ...doc.config.dataset,
+                steps: AnalyticsExplorationModel.migrateFunnelSteps(steps),
+              },
+            },
+          } as DashboardBlockInterface | CreateDashboardBlockInterface;
+        }
+      }
+      return doc;
+    }
+    case "metric-explorer":
+    case "markdown":
+    case "experiment-metadata":
+    case "experiment-traffic":
+    case "metric-exploration":
+    case "fact-table-exploration":
+    case "data-source-exploration":
+    case "sql-exploration":
+    default:
+      return doc;
+  }
+}
+
+function toBlockApiInterface(
+  block: DashboardBlockInterface,
+): ApiDashboardBlockInterface {
+  switch (block.type) {
+    case "metric-explorer":
+      return {
+        ...block,
+        analysisSettings: {
+          ...block.analysisSettings,
+          startDate: getValidDate(
+            block.analysisSettings.startDate,
+          ).toISOString(),
+          endDate: getValidDate(block.analysisSettings.endDate).toISOString(),
+        },
+      };
+    case "experiment-metric":
+    case "experiment-dimension":
+    case "experiment-time-series":
+    case "sql-explorer":
+    case "markdown":
+    case "experiment-metadata":
+    case "metric-experiments":
+    case "experiments-scaled-impact":
+    case "experiments-win-rate":
+    case "experiments-status":
+    case "experiment-traffic":
+    case "metric-exploration":
+    case "fact-table-exploration":
+    case "data-source-exploration":
+    case "sql-exploration":
+    case "funnel-exploration":
+    default:
+      return block;
+  }
+}
+
+export function fromBlockApiInterface(
+  apiBlock:
+    | ApiDashboardBlockInterface
+    // Only reached once its chart has been run; see `runNewApiExplorationBlocks`.
+    | DashboardBlockWithAnalysisId<ApiCreateDashboardBlockInterface>,
+): DashboardBlockInterface | CreateDashboardBlockInterface {
+  switch (apiBlock.type) {
+    case "metric-explorer":
+      return {
+        ...apiBlock,
+        analysisSettings: {
+          ...apiBlock.analysisSettings,
+          startDate: getValidDate(apiBlock.analysisSettings.startDate),
+          endDate: getValidDate(apiBlock.analysisSettings.endDate),
+        },
+      };
+    case "sql-explorer":
+      return {
+        ...apiBlock,
+        blockConfig: apiBlock.blockConfig ?? [],
+      };
+    case "experiment-metric":
+    case "experiment-dimension":
+    case "experiment-time-series":
+    case "markdown":
+    case "experiment-metadata":
+    case "metric-experiments":
+    case "experiments-scaled-impact":
+    case "experiments-win-rate":
+    case "experiments-status":
+    case "experiment-traffic":
+    case "metric-exploration":
+    case "fact-table-exploration":
+    case "data-source-exploration":
+    case "sql-exploration":
+    case "funnel-exploration":
+    default:
+      return apiBlock;
+  }
+}
+
+const clamp = (value: number, min: number, max: number): number =>
+  Math.max(min, Math.min(max, value));
+
+// Normalize block layouts: fill in per-type defaults for blocks without a
+// layout (stacked beneath existing blocks) and clamp w/x/y to grid bounds.
+// Height is intentionally unclamped - users can grow a block as tall as they
+// need. Per-type drag/resize minimums are NOT persisted - they live in
+// DEFAULT_BLOCK_SIZE_BY_TYPE and are injected at render time on the client.
+export function normalizeLayouts<
+  T extends DashboardBlockInterface | CreateDashboardBlockInterface,
+>(blocks: T[], cols: number = DASHBOARD_GRID_COLS): T[] {
+  // Find the largest y+h among blocks that already have a layout; new blocks
+  // get stacked below this so we never overlap existing content.
+  let nextY = 0;
+  const clampedExisting = blocks.map((block) => {
+    if (!block.layout) return block;
+    const w = clamp(block.layout.w, 1, cols);
+    const h = Math.max(1, block.layout.h);
+    const x = clamp(block.layout.x, 0, Math.max(0, cols - w));
+    const y = Math.max(0, block.layout.y);
+    const layout: BlockLayout = {
+      x,
+      y,
+      w,
+      h,
+      ...(block.layout.static ? { static: true } : {}),
+    };
+    nextY = Math.max(nextY, y + h);
+    return { ...block, layout };
+  });
+
+  return clampedExisting.map((block) => {
+    if (block.layout) return block;
+    const defaults = getBlockSizeBounds(block.type);
+    const w = clamp(defaults.w, 1, cols);
+    const h = Math.max(1, defaults.h);
+    const layout: BlockLayout = {
+      x: 0,
+      y: nextY,
+      w,
+      h,
+    };
+    nextY += h;
+    return { ...block, layout };
+  });
+}

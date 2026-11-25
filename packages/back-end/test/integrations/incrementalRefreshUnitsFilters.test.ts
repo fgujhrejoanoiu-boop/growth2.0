@@ -1,0 +1,280 @@
+import { ExperimentSnapshotSettings } from "shared/types/experiment-snapshot";
+import { ExposureQuery } from "shared/types/datasource";
+import { SegmentInterface } from "shared/types/segment";
+import BigQuery from "back-end/src/integrations/BigQuery";
+
+// Incremental units query must apply segment and queryFilter to new
+// exposures only, with the same JOIN / WHERE s.date <= timestamp shape as
+// the non-incremental units query. Query filter stays on the exposure CTE
+// so its columns cannot collide with the segment relation.
+
+const exposureQuery: ExposureQuery = {
+  id: "exposure",
+  name: "Exposure",
+  description: "",
+  query: "SELECT * FROM exposures",
+  userIdType: "user_id",
+  dimensions: [],
+};
+
+const resolvedExposureQuery = {
+  query: exposureQuery.query,
+  identifierType: exposureQuery.userIdType,
+};
+
+const segment: SegmentInterface = {
+  id: "seg_1",
+  organization: "org_1",
+  owner: "",
+  datasource: "ds_1",
+  dateCreated: new Date("2024-01-01"),
+  dateUpdated: new Date("2024-01-01"),
+  name: "Paid users",
+  description: "",
+  userIdType: "user_id",
+  type: "SQL",
+  sql: "SELECT user_id, date FROM paid_users",
+};
+
+const baseSettings: ExperimentSnapshotSettings = {
+  manual: false,
+  dimensions: [],
+  metricSettings: [],
+  goalMetrics: [],
+  secondaryMetrics: [],
+  guardrailMetrics: [],
+  activationMetric: null,
+  defaultMetricPriorSettings: {
+    override: false,
+    proper: false,
+    mean: 0,
+    stddev: 0,
+  },
+  regressionAdjustmentEnabled: false,
+  attributionModel: "firstExposure",
+  experimentId: "exp_1",
+  queryFilter: "",
+  segment: "",
+  skipPartialData: false,
+  datasourceId: "ds_1",
+  exposureQueryId: "exposure",
+  startDate: new Date("2024-01-01"),
+  endDate: new Date("2024-02-01"),
+  variations: [],
+};
+
+function newExposuresCte(sql: string): string {
+  const start = sql.indexOf("__filteredNewExposures AS (");
+  const end = sql.indexOf("__experimentUnits AS (");
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  return sql.slice(start, end);
+}
+
+describe("incremental refresh units query segment and query filter", () => {
+  let integration: BigQuery;
+
+  beforeEach(() => {
+    // @ts-expect-error -- context not needed for this unit test
+    integration = new BigQuery("", {
+      type: "bigquery",
+      settings: { queries: { exposure: [exposureQuery] } },
+    });
+  });
+
+  function buildSql(
+    settings: ExperimentSnapshotSettings,
+    segmentObj: SegmentInterface | null,
+  ) {
+    return integration.getUpdateExperimentIncrementalUnitsQuery({
+      settings,
+      exposureQuery: resolvedExposureQuery,
+      activationMetric: null,
+      dimensions: [],
+      factTableMap: new Map(),
+      segment: segmentObj,
+      unitsTableFullName: "proj.ds.units",
+      unitsTempTableFullName: "proj.ds.units_tmp",
+      incrementalRefreshStartTime: new Date("2024-01-15"),
+      lastMaxTimestamp: null,
+    });
+  }
+
+  it("filters new exposures through the segment", () => {
+    const sql = buildSql({ ...baseSettings, segment: "seg_1" }, segment);
+    expect(sql).toMatch(/__segment as \(/i);
+    const cte = newExposuresCte(sql);
+    expect(cte).toMatch(/JOIN __segment s ON \(s\.user_id = e\.user_id\)/i);
+    // Timestamp stays raw for UNION with the units table; BQ still needs
+    // the exposure side cast to compare against the segment DATETIME.
+    expect(cte).toMatch(
+      /s\.date <= CAST\s*\(\s*e\.timestamp as DATETIME\s*\)/i,
+    );
+    expect(cte).not.toMatch(/SELECT DISTINCT/i);
+    expect(cte).not.toMatch(/EXISTS/i);
+  });
+
+  it("applies the query filter to new exposures", () => {
+    const sql = buildSql(
+      { ...baseSettings, queryFilter: "e.country = 'US'" },
+      null,
+    );
+    const cte = newExposuresCte(sql);
+    expect(cte).toMatch(/WHERE[\s\S]*AND \(\s*e\.country = 'US'\s*\)/);
+    expect(sql).not.toContain("__segment");
+  });
+
+  it("applies both the segment and the query filter to new exposures", () => {
+    const sql = buildSql(
+      { ...baseSettings, segment: "seg_1", queryFilter: "country = 'US'" },
+      segment,
+    );
+    const cte = newExposuresCte(sql);
+    expect(cte).toMatch(/AND \(\s*country = 'US'\s*\)/);
+    expect(cte).toMatch(/JOIN __segment s ON/i);
+    // Query filter is on __filteredNewExposures so unqualified columns
+    // cannot collide with the later segment join.
+    expect(cte.indexOf("country")).toBeLessThan(cte.search(/JOIN __segment/i));
+  });
+
+  it("leaves the new exposures unfiltered without a segment or query filter", () => {
+    const sql = buildSql(baseSettings, null);
+    const cte = newExposuresCte(sql);
+    expect(sql).not.toContain("__segment");
+    expect(cte).not.toContain("JOIN");
+    expect(cte).not.toMatch(/EXISTS/i);
+    expect(cte).not.toContain("s.date");
+    expect(cte).toMatch(
+      /FROM\s+__newExposures e\s+WHERE\s+e\.experiment_id = 'exp_1'/,
+    );
+  });
+});
+
+describe("incremental refresh units query for cluster experiments", () => {
+  const clusterExposureQuery: ExposureQuery = {
+    id: "exposure",
+    name: "Exposure",
+    description: "",
+    query: "SELECT * FROM exposures",
+    userIdType: "region_id",
+    dimensions: [],
+  };
+
+  const clusterResolvedExposureQuery = {
+    query: clusterExposureQuery.query,
+    identifierType: clusterExposureQuery.userIdType,
+  };
+
+  const clusterSettings: ExperimentSnapshotSettings = {
+    ...baseSettings,
+    isClusterExperiment: true,
+    clusterSubUnitIdentifier: "user_id",
+  };
+
+  let integration: BigQuery;
+
+  beforeEach(() => {
+    // @ts-expect-error -- context not needed for this unit test
+    integration = new BigQuery("", {
+      type: "bigquery",
+      settings: { queries: { exposure: [clusterExposureQuery] } },
+    });
+  });
+
+  it("creates the units table keyed on the sub-unit with a cluster id column", () => {
+    const sql = integration.getCreateExperimentIncrementalUnitsQuery({
+      settings: clusterSettings,
+      exposureQuery: clusterResolvedExposureQuery,
+      activationMetric: null,
+      dimensions: [],
+      factTableMap: new Map(),
+      unitsTableFullName: "proj.ds.units",
+    });
+
+    // Sub-unit is the table key; cluster id is carried alongside.
+    expect(sql).toMatch(/CREATE TABLE proj\.ds\.units\s*\(\s*user_id\b/);
+    expect(sql).toMatch(/\bregion_id\b/);
+    // Never keyed on the cluster id directly.
+    expect(sql).not.toMatch(/\(\s*region_id\b/);
+  });
+
+  it("aggregates the units on the sub-unit and carries the cluster id", () => {
+    const sql = integration.getUpdateExperimentIncrementalUnitsQuery({
+      settings: clusterSettings,
+      exposureQuery: clusterResolvedExposureQuery,
+      activationMetric: null,
+      dimensions: [],
+      factTableMap: new Map(),
+      segment: null,
+      unitsTableFullName: "proj.ds.units",
+      unitsTempTableFullName: "proj.ds.units_tmp",
+      incrementalRefreshStartTime: new Date("2024-01-15"),
+      lastMaxTimestamp: null,
+    });
+
+    // The per-sub-unit aggregation groups by the sub-unit, not the cluster.
+    expect(sql).toMatch(/GROUP BY\s+user_id/i);
+    // One cluster per subunit; a subunit seen in several is marked
+    // '__multiple__' so it can be dropped.
+    expect(sql).toMatch(
+      /WHEN\s+COUNT\s*\(\s*DISTINCT\s+e\.region_id\s*\)\s*>\s*1\s+THEN\s+'__multiple__'\s+ELSE\s+MAX\s*\(\s*e\.region_id\s*\)\s+END\s*\)\s+AS region_id/i,
+    );
+    // New exposures project the cluster id (cast to string like the sub-unit).
+    expect(sql).toMatch(/e\.region_id[\s\S]*AS region_id/i);
+  });
+
+  it("omits the cluster id column for non-cluster experiments", () => {
+    const sql = integration.getUpdateExperimentIncrementalUnitsQuery({
+      settings: baseSettings,
+      exposureQuery: resolvedExposureQuery,
+      activationMetric: null,
+      dimensions: [],
+      factTableMap: new Map(),
+      segment: null,
+      unitsTableFullName: "proj.ds.units",
+      unitsTempTableFullName: "proj.ds.units_tmp",
+      incrementalRefreshStartTime: new Date("2024-01-15"),
+      lastMaxTimestamp: null,
+    });
+
+    expect(sql).not.toMatch(/region_id/i);
+    expect(sql).toMatch(/GROUP BY\s+user_id/i);
+  });
+
+  function buildClusterSql(segmentObj: SegmentInterface) {
+    return integration.getUpdateExperimentIncrementalUnitsQuery({
+      settings: { ...clusterSettings, segment: segmentObj.id },
+      exposureQuery: clusterResolvedExposureQuery,
+      activationMetric: null,
+      dimensions: [],
+      factTableMap: new Map(),
+      segment: segmentObj,
+      unitsTableFullName: "proj.ds.units",
+      unitsTempTableFullName: "proj.ds.units_tmp",
+      incrementalRefreshStartTime: new Date("2024-01-15"),
+      lastMaxTimestamp: null,
+    });
+  }
+
+  it("joins a cluster-keyed segment on the cluster column without an identity join", () => {
+    // No region_id<->user_id identity join is configured, so this would throw
+    // if the segment were routed through getIdentitiesCTE.
+    const sql = buildClusterSql({
+      ...segment,
+      userIdType: "region_id",
+      sql: "SELECT region_id, date FROM paid_regions",
+    });
+    expect(newExposuresCte(sql)).toMatch(
+      /JOIN __segment s ON \(s\.region_id = e\.region_id\)/i,
+    );
+    expect(sql).not.toMatch(/__identities/i);
+  });
+
+  it("joins a sub-unit-keyed segment on the sub-unit column", () => {
+    const sql = buildClusterSql(segment);
+    expect(newExposuresCte(sql)).toMatch(
+      /JOIN __segment s ON \(s\.user_id = e\.user_id\)/i,
+    );
+    expect(sql).not.toMatch(/__identities/i);
+  });
+});

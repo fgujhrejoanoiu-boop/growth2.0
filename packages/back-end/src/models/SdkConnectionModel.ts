@@ -1,0 +1,955 @@
+import mongoose from "mongoose";
+import uniqid from "uniqid";
+import { z } from "zod";
+import { isEqual, isUndefined, omit, omitBy } from "lodash";
+import {
+  managedByValidator,
+  ManagedBy,
+  ApiSdkConnection,
+  savedGroupFormatValidator,
+  SdkPayloadSize,
+  SdkPayloadSizeLevel,
+  withNewSdkConnectionDefaults,
+} from "shared/validators";
+import {
+  CreateSDKConnectionParams,
+  EditSDKConnectionParams,
+  ProxyConnection,
+  ProxyTestResult,
+  SDKConnectionInterface,
+  SDKLanguage,
+} from "shared/types/sdk-connection";
+import { WEBHOOK_CONSECUTIVE_FAILURES_THRESHOLD } from "shared/constants";
+import {
+  savedGroupFormatFromConnection,
+  withLegacySavedGroupFlag,
+} from "shared/sdk-versioning";
+import {
+  cancellableFetch,
+  trimTrailingSlashes,
+} from "back-end/src/util/http.util";
+import {
+  IS_CLOUD,
+  PROXY_ENABLED,
+  PROXY_HOST_INTERNAL,
+  PROXY_HOST_PUBLIC,
+} from "back-end/src/util/secrets";
+import { errorStringFromZodResult } from "back-end/src/util/validation";
+import { ApiReqContext } from "back-end/types/api";
+import { ReqContext } from "back-end/types/request";
+import { addCloudSDKMapping } from "back-end/src/services/licenseServerManagedClickhouse";
+import { logger } from "back-end/src/util/logger";
+import { purgeCDNCache } from "back-end/src/util/cdn.util";
+import { getSDKPayloadCacheLocation } from "back-end/src/models/SdkConnectionCacheModel";
+import { queueSDKPayloadRefresh } from "back-end/src/services/features";
+import { createModelAuditLogger } from "back-end/src/services/audit";
+import { sdkConnectionAuditDetails } from "back-end/src/models/AuditModel";
+import { CasConflictError } from "back-end/src/models/BaseModel";
+import {
+  getBackendFeatureValue,
+  getTrustedOrgAttributes,
+} from "back-end/src/services/growthbook";
+import {
+  generateEncryptionKey,
+  generateSigningKey,
+} from "back-end/src/util/api-key.util";
+
+const audit = createModelAuditLogger({
+  entity: "sdk-connection",
+  createEvent: "sdk-connection.create",
+  updateEvent: "sdk-connection.update",
+  deleteEvent: "sdk-connection.delete",
+  toAuditDetails: sdkConnectionAuditDetails,
+});
+
+const sdkConnectionSchema = new mongoose.Schema({
+  id: {
+    type: String,
+    unique: true,
+  },
+  organization: {
+    type: String,
+    index: true,
+  },
+  name: String,
+  dateCreated: Date,
+  dateUpdated: Date,
+  languages: [String],
+  sdkVersion: String,
+  environment: String,
+  project: String,
+  projects: [String],
+  encryptPayload: Boolean,
+  encryptionKey: String,
+  hashSecureAttributes: Boolean,
+  includeVisualExperiments: Boolean,
+  includeDraftExperiments: Boolean,
+  includeDraftExperimentRefs: Boolean,
+  includeExperimentNames: Boolean,
+  includeRedirectExperiments: Boolean,
+  includeRuleIds: Boolean,
+  includeProjectIdInMetadata: Boolean,
+  includeCustomFieldsInMetadata: Boolean,
+  allowedCustomFieldsInMetadata: [String],
+  includeTagsInMetadata: Boolean,
+  includeExperimentScheduleInMetadata: Boolean,
+  includeReferencedPrerequisites: Boolean,
+  connected: Boolean,
+  remoteEvalEnabled: Boolean,
+  tracesEnabled: Boolean,
+  savedGroupReferencesEnabled: Boolean,
+  savedGroupFormat: String,
+  eventTracker: String,
+  archived: Boolean,
+  managedBy: {},
+  key: {
+    type: String,
+    unique: true,
+  },
+  proxy: {
+    enabled: Boolean,
+    host: String,
+    hostExternal: String,
+    signingKey: String,
+    connected: Boolean,
+    version: String,
+    error: String,
+    lastError: Date,
+    consecutiveFailures: Number,
+    failingSince: Date,
+    failureAlertedAt: Date,
+  },
+  payloadSize: {
+    bytes: Number,
+    limitBytes: Number,
+    measuredAt: Date,
+    breakdown: {},
+  },
+  notifiedPayloadSizeLevel: String,
+});
+
+type SDKConnectionDocument = mongoose.Document & SDKConnectionInterface;
+
+const SDKConnectionModel = mongoose.model<SDKConnectionInterface>(
+  "SdkConnection",
+  sdkConnectionSchema,
+);
+
+function addEnvProxySettings(proxy: ProxyConnection): ProxyConnection {
+  if (IS_CLOUD) return proxy;
+
+  return {
+    ...proxy,
+    enabled: PROXY_ENABLED,
+    host: PROXY_HOST_INTERNAL || PROXY_HOST_PUBLIC,
+    hostExternal: PROXY_HOST_PUBLIC || PROXY_HOST_INTERNAL,
+  };
+}
+
+function toInterface(doc: SDKConnectionDocument): SDKConnectionInterface {
+  const conn = doc.toJSON<SDKConnectionDocument>();
+  conn.proxy = addEnvProxySettings(conn.proxy);
+
+  // Migrate old project setting to projects
+  if (
+    !conn.projects?.length &&
+    (conn as SDKConnectionDocument & { project?: string }).project
+  ) {
+    const project = (conn as SDKConnectionDocument & { project: string })
+      .project;
+    conn.projects = [project];
+    (conn as SDKConnectionDocument & { project?: string }).project = "";
+  }
+
+  // Migrate the old on/off reference setting to the three-way format.
+  // Deliberately never picks referencesV2: moving an existing connection onto
+  // the new payload shape has to be someone's decision, not a side effect of
+  // deploying.
+  if (!conn.savedGroupFormat) {
+    conn.savedGroupFormat = savedGroupFormatFromConnection(conn);
+  }
+
+  const result = omit(conn, ["__v", "_id"]);
+  // Measured against the payload cache, so meaningless without one
+  if (getSDKPayloadCacheLocation() !== "mongo") delete result.payloadSize;
+  return result;
+}
+
+export async function findSDKConnectionById(
+  context: ReqContext | ApiReqContext,
+  id: string,
+) {
+  const doc = await SDKConnectionModel.findOne({
+    organization: context.org.id,
+    id,
+  });
+
+  if (!doc) return null;
+
+  const connection = toInterface(doc);
+  return context.permissions.canReadMultiProjectResource(connection.projects)
+    ? connection
+    : null;
+}
+
+export async function findSDKConnectionsByOrganization(
+  context: ReqContext | ApiReqContext,
+) {
+  const docs = await SDKConnectionModel.find({
+    organization: context.org.id,
+  });
+  return readableConnections(context, docs);
+}
+
+// The connections that serve a payload: an archived one can't satisfy a launch
+// check or count toward what SDKs support.
+export async function findServingSDKConnections(
+  context: ReqContext | ApiReqContext,
+) {
+  return (await findSDKConnectionsByOrganization(context)).filter(
+    (c) => !c.archived,
+  );
+}
+
+function readableConnections(
+  context: ReqContext | ApiReqContext,
+  docs: SDKConnectionDocument[],
+): SDKConnectionInterface[] {
+  return docs
+    .map(toInterface)
+    .filter((conn) =>
+      context.permissions.canReadMultiProjectResource(conn.projects),
+    );
+}
+
+// For super admin views of another org, which have no ReqContext for it
+export async function _dangerousCountSDKConnectionsByOrganization(
+  organization: string,
+): Promise<number> {
+  return SDKConnectionModel.countDocuments({ organization });
+}
+
+// Not filtered by the caller's project read access: used as a referential
+// integrity check before an environment is removed.
+export async function countSDKConnectionsByEnvironment(
+  context: ReqContext | ApiReqContext,
+  environment: string,
+) {
+  return await SDKConnectionModel.countDocuments({
+    organization: context.org.id,
+    environment,
+  });
+}
+
+export async function findAllSDKConnectionsAcrossAllOrgs() {
+  const docs = await SDKConnectionModel.find();
+  return docs.map(toInterface);
+}
+
+export async function findSDKConnectionsById(context: ReqContext, id: string) {
+  const doc = await SDKConnectionModel.findOne({
+    organization: context.org.id,
+    id,
+  });
+  return doc ? toInterface(doc) : null;
+}
+
+export async function findSDKConnectionsByIds(
+  context: ReqContext,
+  ids: string[],
+) {
+  const docs = await SDKConnectionModel.find({
+    organization: context.org.id,
+    id: { $in: ids },
+  });
+  return docs.map(toInterface);
+}
+
+// Throws unless every id is a connection in the org that `can` allows.
+export async function assertCanUseSDKConnections(
+  context: ReqContext,
+  ids: string[],
+  can: (conn: SDKConnectionInterface) => boolean,
+) {
+  const conns = await findSDKConnectionsByIds(context, ids);
+  if (conns.length !== new Set(ids).size) {
+    context.throwBadRequestError("Unknown SDK Connection id");
+  }
+  if (!conns.every(can)) context.permissions.throwPermissionError();
+  return conns;
+}
+
+// Not org-scoped — authenticated callers must scope to their own org.
+// Archived connections stop serving, so their key doesn't resolve unless
+// `includeArchived` is passed.
+export async function findSDKConnectionByKey(
+  key: string,
+  { includeArchived = false }: { includeArchived?: boolean } = {},
+) {
+  if (key && typeof key !== "string") return null;
+  const doc = await SDKConnectionModel.findOne({ key });
+  return doc ? visibleByKey(toInterface(doc), includeArchived) : null;
+}
+
+// Org-scoped only; does not check project-read (unlike findSDKConnectionById).
+export async function findSDKConnectionByKeyForOrg(
+  context: ReqContext | ApiReqContext,
+  key: string,
+  { includeArchived = false }: { includeArchived?: boolean } = {},
+) {
+  const doc = await SDKConnectionModel.findOne({
+    organization: context.org.id,
+    key,
+  });
+  return doc ? visibleByKey(toInterface(doc), includeArchived) : null;
+}
+
+function visibleByKey(
+  connection: SDKConnectionInterface,
+  includeArchived: boolean,
+) {
+  return !includeArchived && connection.archived ? null : connection;
+}
+
+export const createSDKConnectionValidator = z
+  .object({
+    organization: z.string(),
+    name: z.string(),
+    languages: z.array(z.string()),
+    sdkVersion: z.string().optional(),
+    environment: z.string(),
+    projects: z.array(z.string()),
+    encryptPayload: z.boolean(),
+    hashSecureAttributes: z.boolean().optional(),
+    includeVisualExperiments: z.boolean().optional(),
+    includeDraftExperiments: z.boolean().optional(),
+    includeDraftExperimentRefs: z.boolean().optional(),
+    includeExperimentNames: z.boolean().optional(),
+    includeRedirectExperiments: z.boolean().optional(),
+    includeRuleIds: z.boolean().optional(),
+    includeProjectIdInMetadata: z.boolean().optional(),
+    includeCustomFieldsInMetadata: z.boolean().optional(),
+    allowedCustomFieldsInMetadata: z.array(z.string()).optional(),
+    includeTagsInMetadata: z.boolean().optional(),
+    includeExperimentScheduleInMetadata: z.boolean().optional(),
+    proxyEnabled: z.boolean().optional(),
+    proxyHost: z.string().optional(),
+    remoteEvalEnabled: z.boolean().optional(),
+    tracesEnabled: z.boolean().optional(),
+    savedGroupReferencesEnabled: z.boolean().optional(),
+    savedGroupFormat: savedGroupFormatValidator.optional(),
+    includeReferencedPrerequisites: z.boolean().optional(),
+    managedBy: managedByValidator.optional(),
+  })
+  .strict();
+
+export function assertCanEnableTraces(context: ReqContext | ApiReqContext) {
+  if (
+    !getBackendFeatureValue(
+      "trace-ingest",
+      false,
+      getTrustedOrgAttributes(context.org),
+    )
+  ) {
+    context.throwBadRequestError(
+      "Traces aren't available for this organization.",
+    );
+  }
+}
+
+function generateSDKConnectionKey() {
+  // IMPORTANT: we use the /^sdk-/ regex to match against this for incoming API requests
+  // DO NOT CHANGE the prefix without also updating that
+  return generateSigningKey("sdk-", 12);
+}
+
+export async function createSDKConnection(
+  context: ReqContext | ApiReqContext,
+  params: CreateSDKConnectionParams,
+) {
+  const { proxyEnabled, proxyHost, languages, ...otherParams } =
+    withNewSdkConnectionDefaults(createSDKConnectionValidator.parse(params));
+  if (otherParams.tracesEnabled) assertCanEnableTraces(context);
+
+  // TODO: if using a proxy, try to validate the connection
+  const connection: SDKConnectionInterface = {
+    ...withLegacySavedGroupFlag(otherParams),
+    organization: context.org.id,
+    languages: languages as SDKLanguage[],
+    id: uniqid("sdk_"),
+    dateCreated: new Date(),
+    dateUpdated: new Date(),
+    encryptionKey: await generateEncryptionKey(),
+    connected: false,
+    // This is not for cryptography, it just needs to be long enough to be unique
+    key: generateSDKConnectionKey(),
+    proxy: addEnvProxySettings({
+      enabled: !!proxyEnabled,
+      host: proxyHost || "",
+      hostExternal: proxyHost || "",
+      signingKey: generateSigningKey(),
+      connected: false,
+      lastError: null,
+      version: "",
+      error: "",
+      consecutiveFailures: 0,
+    }),
+  };
+
+  if (connection.proxy.enabled) {
+    if (connection.proxy.host) {
+      const res = await testProxyConnection(context, connection, false);
+      if (res) {
+        connection.proxy.connected = !res.error;
+        connection.proxy.version = res.version || "";
+      }
+    } else {
+      connection.proxy.connected = true;
+    }
+  }
+
+  const doc = await SDKConnectionModel.create(connection);
+
+  if (IS_CLOUD) {
+    const { key, organization } = connection;
+    try {
+      await addCloudSDKMapping(key, organization);
+    } catch (e) {
+      logger.error(
+        e,
+        `Error inserting sdk key mapping (${key} -> ${organization})`,
+      );
+    }
+  }
+
+  queueSDKPayloadRefresh({
+    context,
+    payloadKeys: [],
+    sdkConnections: [connection],
+    auditContext: {
+      event: "created",
+      model: "sdkconnection",
+      id: connection.id,
+    },
+  });
+
+  const created = toInterface(doc);
+  await audit.logCreate(context, created);
+  return created;
+}
+
+export const editSDKConnectionValidator = z
+  .object({
+    name: z.string().optional(),
+    languages: z.array(z.string()).optional(),
+    sdkVersion: z.string().optional(),
+    proxyEnabled: z.boolean().optional(),
+    proxyHost: z.string().optional(),
+    environment: z.string().optional(),
+    projects: z.array(z.string()).optional(),
+    encryptPayload: z.boolean().optional(),
+    hashSecureAttributes: z.boolean().optional(),
+    includeVisualExperiments: z.boolean().optional(),
+    includeDraftExperiments: z.boolean().optional(),
+    includeDraftExperimentRefs: z.boolean().optional(),
+    includeExperimentNames: z.boolean().optional(),
+    includeRedirectExperiments: z.boolean().optional(),
+    includeRuleIds: z.boolean().optional(),
+    includeProjectIdInMetadata: z.boolean().optional(),
+    includeCustomFieldsInMetadata: z.boolean().optional(),
+    allowedCustomFieldsInMetadata: z.array(z.string()).optional(),
+    includeTagsInMetadata: z.boolean().optional(),
+    includeExperimentScheduleInMetadata: z.boolean().optional(),
+    remoteEvalEnabled: z.boolean().optional(),
+    tracesEnabled: z.boolean().optional(),
+    savedGroupReferencesEnabled: z.boolean().optional(),
+    savedGroupFormat: savedGroupFormatValidator.optional(),
+    includeReferencedPrerequisites: z.boolean().optional(),
+    eventTracker: z.string().optional(),
+    archived: z.boolean().optional(),
+  })
+  .strict();
+
+export async function editSDKConnection(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+  updates: EditSDKConnectionParams,
+  // `null` guards a connection that has never been stamped.
+  options?: {
+    casOnDateUpdated?: Date | null;
+    unset?: readonly (keyof SDKConnectionInterface)[];
+  },
+) {
+  const { proxyEnabled, proxyHost, languages, ...rest } =
+    editSDKConnectionValidator.parse(updates);
+  if (rest.tracesEnabled && !connection.tracesEnabled) {
+    assertCanEnableTraces(context);
+  }
+
+  // Keep only the fields that were sent. A field that was left out comes
+  // through as `undefined`, and the payload rebuild below would use that
+  // instead of the saved value.
+  const otherChanges = omitBy(
+    {
+      ...withLegacySavedGroupFlag(rest, connection),
+      languages: languages as SDKLanguage[] | undefined,
+    },
+    isUndefined,
+  );
+
+  let newProxy = {
+    ...connection.proxy,
+  };
+  if (proxyEnabled !== undefined && proxyEnabled !== connection.proxy.enabled) {
+    newProxy.enabled = proxyEnabled;
+    if (proxyEnabled) {
+      newProxy.consecutiveFailures = 0;
+      newProxy.failingSince = null;
+    }
+  }
+  if (proxyHost !== undefined && proxyHost !== connection.proxy.host) {
+    newProxy.host = proxyHost;
+    newProxy.consecutiveFailures = 0;
+    newProxy.failingSince = null;
+
+    if (addEnvProxySettings(newProxy).host) {
+      const res = await testProxyConnection(
+        context,
+        {
+          ...connection,
+          proxy: addEnvProxySettings(newProxy),
+        },
+        false,
+      );
+      if (res) {
+        newProxy.connected = !res.error;
+        newProxy.version = res.version;
+      }
+    } else {
+      newProxy.connected = true;
+    }
+  }
+  newProxy = addEnvProxySettings(newProxy);
+
+  // If we're changing the filter for which features are included, we should ping any
+  // connected proxies to update their cache immediately instead of waiting for the TTL
+  let needsProxyUpdate = false;
+  const keysRequiringProxyUpdate = [
+    "sdkVersion",
+    "projects",
+    "environment",
+    "encryptPayload",
+    "hashSecureAttributes",
+    "remoteEvalEnabled",
+    "includeVisualExperiments",
+    "includeDraftExperiments",
+    "includeDraftExperimentRefs",
+    "includeExperimentNames",
+    "includeRedirectExperiments",
+    "includeRuleIds",
+    "includeProjectIdInMetadata",
+    "includeCustomFieldsInMetadata",
+    "allowedCustomFieldsInMetadata",
+    "includeTagsInMetadata",
+    "includeExperimentScheduleInMetadata",
+    "savedGroupReferencesEnabled",
+    "archived",
+    "savedGroupFormat",
+    "includeReferencedPrerequisites",
+  ] as const;
+  const fullChanges = {
+    ...otherChanges,
+    proxy: newProxy,
+    project: "",
+    dateUpdated: new Date(),
+  };
+  // A key also being set (the legacy saved group flag) can't be unset too.
+  const unset = (options?.unset ?? []).filter((key) => !(key in fullChanges));
+
+  keysRequiringProxyUpdate.forEach((key) => {
+    if (
+      (key in otherChanges && !isEqual(otherChanges[key], connection[key])) ||
+      (unset.includes(key) && connection[key] !== undefined)
+    ) {
+      needsProxyUpdate = true;
+    }
+  });
+
+  const casOnDateUpdated = options?.casOnDateUpdated;
+  const result = await SDKConnectionModel.updateOne(
+    {
+      organization: context.org.id,
+      id: connection.id,
+      ...(casOnDateUpdated !== undefined && {
+        dateUpdated:
+          casOnDateUpdated === null ? { $exists: false } : casOnDateUpdated,
+      }),
+    },
+    {
+      $set: fullChanges,
+      ...(unset.length > 0 && {
+        $unset: Object.fromEntries(unset.map((key) => [key, ""])),
+      }),
+    },
+  );
+  if (casOnDateUpdated !== undefined && result.matchedCount === 0) {
+    throw new CasConflictError();
+  }
+
+  const updated: SDKConnectionInterface = { ...connection, ...fullChanges };
+  unset.forEach((key) => delete updated[key]);
+
+  // An archived connection stops serving: purge its cache instead of refreshing.
+  if (updated.archived) {
+    if (!connection.archived) {
+      await purgeArchivedConnectionCache(context, updated);
+    }
+  } else if (needsProxyUpdate) {
+    queueSDKPayloadRefresh({
+      context,
+      payloadKeys: [],
+      sdkConnections: [updated],
+      auditContext: {
+        event: "updated",
+        model: "sdkconnection",
+        id: connection.id,
+      },
+    });
+  }
+
+  await audit.logUpdate(context, connection, updated);
+  return updated;
+}
+
+async function purgeArchivedConnectionCache(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+) {
+  try {
+    await context.models.sdkConnectionCache.deleteByKey(connection.key);
+  } catch (e) {
+    logger.warn(e, "Failed to delete cache entry for archived SDK connection");
+  }
+  await purgeCDNCache(context.org.id, [connection.key]);
+}
+
+// Webhooks have no version of their own, so a direct webhook write advances its
+// connections' stamp and a publish computed against the older state loses.
+export async function touchSDKConnections(context: ReqContext, ids: string[]) {
+  if (!ids.length) return;
+  await SDKConnectionModel.updateMany(
+    { organization: context.org.id, id: { $in: ids } },
+    { $set: { dateUpdated: new Date() } },
+  );
+}
+
+export const updateSdkConnectionsRemoveManagedBy = async (
+  context: ReqContext,
+  managedBy: Partial<ManagedBy>,
+) => {
+  await SDKConnectionModel.updateMany(
+    {
+      organization: context.org.id,
+      managedBy,
+    },
+    {
+      $unset: {
+        managedBy: 1,
+      },
+    },
+  );
+};
+
+export async function deleteSDKConnectionModel(
+  context: ReqContext,
+  sdkConnection: SDKConnectionInterface,
+) {
+  await SDKConnectionModel.deleteOne({
+    organization: context.org.id,
+    id: sdkConnection.id,
+  });
+
+  await audit.logDelete(context, sdkConnection);
+}
+
+export async function markSDKConnectionUsed(key: string) {
+  if (key && typeof key !== "string") return;
+  await SDKConnectionModel.updateOne(
+    { key },
+    {
+      $set: {
+        connected: true,
+      },
+    },
+  );
+}
+
+export async function findSDKConnectionsWithPayloadOver(
+  context: ReqContext | ApiReqContext,
+  minBytes: number,
+): Promise<SDKConnectionInterface[]> {
+  const docs = await SDKConnectionModel.find({
+    organization: context.org.id,
+    "payloadSize.bytes": { $gte: minBytes },
+    // An archived connection serves nothing; its last measurement is stale.
+    archived: { $ne: true },
+  });
+  return readableConnections(context, docs);
+}
+
+export async function setSDKConnectionPayloadSize(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+  payloadSize: SdkPayloadSize,
+) {
+  await SDKConnectionModel.updateOne(
+    { organization: context.org.id, id: connection.id },
+    { $set: { payloadSize } },
+  );
+}
+
+// Moves the notified level from what this connection was read with, so only
+// one of several concurrent payload refreshes announces a change
+export async function claimSDKConnectionNotifiedPayloadSizeLevel(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+  level: SdkPayloadSizeLevel,
+): Promise<boolean> {
+  const result = await SDKConnectionModel.updateOne(
+    {
+      organization: context.org.id,
+      id: connection.id,
+      notifiedPayloadSizeLevel: connection.notifiedPayloadSizeLevel ?? null,
+    },
+    { $set: { notifiedPayloadSizeLevel: level } },
+  );
+  return result.modifiedCount === 1;
+}
+
+export interface ProxyErrorResult {
+  /** This failure disabled the proxy. */
+  disabled: boolean;
+  consecutiveFailures: number;
+  failingSince: Date;
+}
+
+/**
+ * @param countFailure - When false, the error is saved but doesn't count toward disabling the proxy.
+ */
+export async function setProxyError(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+  error: string,
+  { countFailure = true }: { countFailure?: boolean } = {},
+): Promise<ProxyErrorResult> {
+  const now = new Date();
+  const consecutiveFailures =
+    (connection.proxy.consecutiveFailures || 0) + (countFailure ? 1 : 0);
+  const disabled =
+    connection.proxy.enabled &&
+    consecutiveFailures >= WEBHOOK_CONSECUTIVE_FAILURES_THRESHOLD;
+  const failingSince = connection.proxy.failingSince ?? now;
+  await SDKConnectionModel.updateOne(
+    {
+      organization: context.org.id,
+      id: connection.id,
+    },
+    {
+      $set: {
+        "proxy.error": error,
+        "proxy.connected": false,
+        "proxy.lastError": now,
+        "proxy.consecutiveFailures": consecutiveFailures,
+        "proxy.failingSince": failingSince,
+        ...(disabled ? { "proxy.enabled": false } : {}),
+      },
+    },
+  );
+  return { disabled, consecutiveFailures, failingSince };
+}
+
+/**
+ * @param clearFailureAlert - When false, keeps `failureAlertedAt` so a
+ * `proxy.recovered` alert that couldn't be sent is tried again.
+ */
+export async function clearProxyError(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+  { clearFailureAlert = true }: { clearFailureAlert?: boolean } = {},
+) {
+  await SDKConnectionModel.updateOne(
+    {
+      organization: context.org.id,
+      id: connection.id,
+    },
+    {
+      $set: {
+        "proxy.error": "",
+        "proxy.connected": true,
+        "proxy.consecutiveFailures": 0,
+        "proxy.failingSince": null,
+        ...(clearFailureAlert ? { "proxy.failureAlertedAt": null } : {}),
+      },
+    },
+  );
+}
+
+export async function setProxyFailureAlertedAt(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+  failureAlertedAt: Date,
+) {
+  await SDKConnectionModel.updateOne(
+    {
+      organization: context.org.id,
+      id: connection.id,
+    },
+    { $set: { "proxy.failureAlertedAt": failureAlertedAt } },
+  );
+}
+
+export async function testProxyConnection(
+  context: ReqContext | ApiReqContext,
+  connection: SDKConnectionInterface,
+  updateDB: boolean = true,
+  // Whether a healthy proxy is switched back on. Off where that switch is a
+  // reviewed setting, which a test must not change.
+  reenable: boolean = true,
+): Promise<ProxyTestResult | undefined> {
+  const proxy = connection.proxy;
+  if (!proxy) {
+    return {
+      status: 0,
+      error: "Proxy connection is not enabled",
+      version: "",
+      url: "",
+    };
+  }
+
+  if (!proxy.host) {
+    return;
+  }
+
+  const url = trimTrailingSlashes(proxy.host) + "/healthcheck";
+  let statusCode = 0;
+  try {
+    const { responseWithoutBody, stringBody } = await cancellableFetch(
+      url,
+      {
+        method: "GET",
+      },
+      {
+        maxTimeMs: 5000,
+        maxContentSize: 500,
+      },
+    );
+    statusCode = responseWithoutBody.status;
+
+    if (!responseWithoutBody.ok || !stringBody) {
+      return {
+        status: statusCode,
+        error: "Proxy healthcheck returned a non-successful status code",
+        version: "",
+        url,
+      };
+    }
+
+    let json: unknown;
+    try {
+      json = JSON.parse(stringBody);
+    } catch {
+      // JSON.parse's message quotes the body, which must not reach the caller.
+      throw new Error("Proxy healthcheck did not return valid JSON");
+    }
+
+    const validator = z.object({
+      proxyVersion: z.string(),
+    });
+    const res = validator.safeParse(json);
+    if (!res.success) {
+      throw new Error(errorStringFromZodResult(res));
+    }
+
+    const version = res.data.proxyVersion;
+
+    if (updateDB) {
+      await SDKConnectionModel.updateOne(
+        {
+          organization: context.org.id,
+          id: connection.id,
+        },
+        {
+          $set: {
+            "proxy.connected": true,
+            "proxy.version": version,
+            "proxy.error": "",
+            "proxy.consecutiveFailures": 0,
+            // failureAlertedAt stays, so the next successful push still sends
+            // proxy.recovered
+            "proxy.failingSince": null,
+            ...(reenable ? { "proxy.enabled": true } : {}),
+          },
+        },
+      );
+    }
+
+    return {
+      status: statusCode,
+      error: "",
+      version,
+      url,
+    };
+  } catch (e) {
+    return {
+      status: statusCode || 0,
+      error:
+        e?.code === "ECONNREFUSED"
+          ? "Failed to connect to proxy server (ECONNREFUSED)"
+          : e.message || "Failed to connect to proxy server",
+      version: "",
+      url,
+    };
+  }
+}
+
+export function toApiSDKConnectionInterface(
+  connection: SDKConnectionInterface,
+): ApiSdkConnection {
+  return {
+    id: connection.id,
+    name: connection.name,
+    organization: connection.organization,
+    dateCreated: connection.dateCreated.toISOString(),
+    dateUpdated: connection.dateUpdated.toISOString(),
+    languages: connection.languages,
+    sdkVersion: connection.sdkVersion,
+    environment: connection.environment,
+    project: connection.projects[0] || "",
+    projects: connection.projects,
+    encryptPayload: !!connection.encryptPayload,
+    encryptionKey: connection.encryptionKey,
+    hashSecureAttributes: !!connection.hashSecureAttributes,
+    includeVisualExperiments: !!connection.includeVisualExperiments,
+    includeDraftExperiments: !!connection.includeDraftExperiments,
+    includeDraftExperimentRefs: !!connection.includeDraftExperimentRefs,
+    includeExperimentNames: !!connection.includeExperimentNames,
+    includeRedirectExperiments: !!connection.includeRedirectExperiments,
+    includeRuleIds: !!connection.includeRuleIds,
+    includeProjectIdInMetadata: !!connection.includeProjectIdInMetadata,
+    includeCustomFieldsInMetadata: !!connection.includeCustomFieldsInMetadata,
+    allowedCustomFieldsInMetadata: connection.allowedCustomFieldsInMetadata,
+    includeTagsInMetadata: !!connection.includeTagsInMetadata,
+    includeExperimentScheduleInMetadata:
+      !!connection.includeExperimentScheduleInMetadata,
+    tracesEnabled: !!connection.tracesEnabled,
+    key: connection.key,
+    proxyEnabled: !!connection.proxy.enabled,
+    proxyHost: connection.proxy.host,
+    proxySigningKey: connection.proxy.signingKey,
+    remoteEvalEnabled: !!connection.remoteEvalEnabled,
+    savedGroupReferencesEnabled: !!connection.savedGroupReferencesEnabled,
+    savedGroupFormat: savedGroupFormatFromConnection(connection),
+    includeReferencedPrerequisites: !!connection.includeReferencedPrerequisites,
+    archived: !!connection.archived,
+  };
+}
