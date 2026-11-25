@@ -1,0 +1,207 @@
+import { z } from "zod";
+import {
+  DIMENSION_NULL_LABEL_MAX_LENGTH,
+  MAX_DESCRIPTION_LENGTH,
+} from "shared/constants";
+import { ownerEmailField, ownerField, ownerInputField } from "./owner-field";
+import { apiPaginationFieldsValidator, paginationQueryFields } from "./shared";
+
+import { namedSchema } from "./openapi-helpers";
+import { GENERIC_NAME_DESCRIPTION } from "./api-field-descriptions";
+
+export const dimensionTimingValidator = z.enum([
+  "none",
+  "rowTimestamp",
+  "validityRange",
+]);
+export type DimensionTiming = z.infer<typeof dimensionTimingValidator>;
+
+const DIMENSION_NULL_LABEL_DESCRIPTION =
+  "Label used in experiment results for units with no dimension value. Leave empty to use the default null label.";
+
+const DIMENSION_TIMING_DESCRIPTION =
+  "What the query returns and how the value at a unit's first exposure is resolved. `none` (default): one value per unit, resolved with MAX(value). `rowTimestamp`: timestamped rows; the query also returns a `timestamp` column and the latest row at or before first exposure is used. `validityRange`: validity ranges; the query also returns `start_timestamp` and `end_timestamp` (NULL = still valid) columns and the row valid at first exposure is used. Only supported for SQL Data Sources.";
+
+// Corresponds to schemas/Dimension.yaml
+export const apiDimensionValidator = namedSchema(
+  "Dimension",
+  z
+    .object({
+      id: z.string(),
+      dateCreated: z.string(),
+      dateUpdated: z.string(),
+      owner: ownerField,
+      ownerEmail: ownerEmailField,
+      datasourceId: z.string(),
+      identifierType: z.string(),
+      name: z.string(),
+      description: z.string().max(MAX_DESCRIPTION_LENGTH).optional(),
+      query: z.string(),
+      timing: dimensionTimingValidator
+        .describe(DIMENSION_TIMING_DESCRIPTION)
+        .optional(),
+      nullLabel: z
+        .string()
+        .max(DIMENSION_NULL_LABEL_MAX_LENGTH)
+        .describe(DIMENSION_NULL_LABEL_DESCRIPTION)
+        .optional(),
+      managedBy: z
+        .enum(["", "api", "config"])
+        .describe(
+          "Where this dimension must be managed from. If not set (empty string), it can be managed from anywhere.",
+        )
+        .optional(),
+    })
+    .strict(),
+);
+
+export type ApiDimension = z.infer<typeof apiDimensionValidator>;
+
+// Corresponds to payload-schemas/PostDimensionPayload.yaml
+const postDimensionBody = z
+  .object({
+    name: z.string().describe(GENERIC_NAME_DESCRIPTION),
+    description: z
+      .string()
+      .max(MAX_DESCRIPTION_LENGTH)
+      .describe("Description of the dimension")
+      .optional(),
+    owner: ownerInputField.optional(),
+    datasourceId: z
+      .string()
+      .describe("ID of the datasource this dimension belongs to"),
+    identifierType: z
+      .string()
+      .describe("Type of identifier (user, anonymous, etc.)"),
+    query: z.string().describe("SQL query or equivalent for the dimension"),
+    timing: dimensionTimingValidator
+      .describe(DIMENSION_TIMING_DESCRIPTION)
+      .optional(),
+    nullLabel: z
+      .string()
+      .max(DIMENSION_NULL_LABEL_MAX_LENGTH)
+      .describe(DIMENSION_NULL_LABEL_DESCRIPTION)
+      .optional(),
+    managedBy: z
+      .enum(["", "api"])
+      .describe(
+        "Where this dimension must be managed from. If not set (empty string), it can be managed from anywhere.",
+      )
+      .optional(),
+  })
+  .strict();
+
+// Corresponds to payload-schemas/UpdateDimensionPayload.yaml
+const updateDimensionBody = postDimensionBody.partial();
+
+const idParams = z
+  .object({
+    id: z.string().describe("The id of the requested resource"),
+  })
+  .strict();
+
+export const listDimensionsValidator = {
+  bodySchema: z.never(),
+  querySchema: z
+    .object({
+      ...paginationQueryFields,
+      datasourceId: z.string().describe("Filter by Data Source").optional(),
+    })
+    .strict(),
+  paramsSchema: z.never(),
+  responseSchema: z.intersection(
+    z.object({
+      dimensions: z.array(apiDimensionValidator),
+    }),
+    apiPaginationFieldsValidator,
+  ),
+  summary: "Get all dimensions",
+  operationId: "listDimensions",
+  tags: ["dimensions"],
+  method: "get" as const,
+  path: "/dimensions",
+};
+
+export const postDimensionValidator = {
+  bodySchema: postDimensionBody,
+  querySchema: z.never(),
+  paramsSchema: z.never(),
+  responseSchema: z
+    .object({
+      dimension: apiDimensionValidator,
+    })
+    .strict(),
+  summary: "Create a single dimension",
+  confirmation: ["dimension.create"] as const,
+  operationId: "postDimension",
+  tags: ["dimensions"],
+  method: "post" as const,
+  path: "/dimensions",
+  exampleRequest: {
+    body: {
+      name: "User Country",
+      datasourceId: "ds_123abc",
+      identifierType: "user",
+      query: "SELECT country FROM users",
+    },
+  },
+};
+
+export const getDimensionValidator = {
+  bodySchema: z.never(),
+  querySchema: z.never(),
+  paramsSchema: idParams,
+  responseSchema: z
+    .object({
+      dimension: apiDimensionValidator,
+    })
+    .strict(),
+  summary: "Get a single dimension",
+  operationId: "getDimension",
+  tags: ["dimensions"],
+  method: "get" as const,
+  path: "/dimensions/:id",
+  exampleRequest: { params: { id: "abc123" } },
+};
+
+export const updateDimensionValidator = {
+  bodySchema: updateDimensionBody,
+  querySchema: z.never(),
+  paramsSchema: idParams,
+  responseSchema: z
+    .object({
+      dimension: apiDimensionValidator,
+    })
+    .strict(),
+  summary: "Update a single dimension",
+  confirmation: ["dimension.edit"] as const,
+  operationId: "updateDimension",
+  tags: ["dimensions"],
+  method: "post" as const,
+  path: "/dimensions/:id",
+  exampleRequest: {
+    params: { id: "abc123" },
+    body: { name: "User Region" },
+  },
+};
+
+export const deleteDimensionValidator = {
+  bodySchema: z.never(),
+  querySchema: z.never(),
+  paramsSchema: idParams,
+  responseSchema: z
+    .object({
+      deletedId: z
+        .string()
+        .describe("The ID of the deleted dimension")
+        .meta({ example: "dim_123abc" }),
+    })
+    .strict(),
+  summary: "Deletes a single dimension",
+  confirmation: ["dimension.delete"] as const,
+  operationId: "deleteDimension",
+  tags: ["dimensions"],
+  method: "delete" as const,
+  path: "/dimensions/:id",
+  exampleRequest: { params: { id: "abc123" } },
+};

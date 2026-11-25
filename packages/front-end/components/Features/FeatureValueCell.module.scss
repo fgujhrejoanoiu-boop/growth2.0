@@ -1,0 +1,13 @@
+.root {
+  textarea {
+    display: block;
+  }
+
+  > :global(.rt-r-display-inline-block) {
+    display: block !important;
+  }
+
+  input:global(.form-control) {
+    width: 100% !important;
+  }
+}

@@ -1,0 +1,260 @@
+import { BANDIT_SRM_DIMENSION_NAME } from "shared/constants";
+import { getClusterSubUnit, getUserIdTypes } from "shared/experiments";
+import { format } from "shared/sql";
+import type { DataSourceInterface } from "shared/types/datasource";
+import type { ExperimentAggregateUnitsQueryParams } from "shared/types/integrations";
+import type { SqlDialect } from "shared/types/sql";
+import { MAX_ROWS_UNIT_AGGREGATE_QUERY } from "back-end/src/services/experimentQueries/constants";
+
+import { getBanditCaseWhen } from "back-end/src/integrations/sql/clauses/bandit-case-when";
+import {
+  getConsistentClusterCondition,
+  getSingleClusterPerUnitCondition,
+} from "back-end/src/integrations/sql/clauses/cluster-assignment-filter";
+import {
+  getBanditDates,
+  getBanditVariationPeriodWeights,
+} from "back-end/src/integrations/sql/clauses/bandit-variation-period-weights";
+import { getDimensionInStatement } from "back-end/src/integrations/sql/fact-metrics/dimension-in-statement";
+import { getExperimentUnitsQuery } from "back-end/src/integrations/sql/queries/experiment-units-query";
+import { getIdentitiesCTE } from "back-end/src/integrations/sql/ctes/identities-cte";
+import { getUnitCountCTE } from "back-end/src/integrations/sql/ctes/unit-count-cte";
+
+export function getExperimentAggregateUnitsQuery(
+  dialect: SqlDialect,
+  datasource: DataSourceInterface,
+  params: ExperimentAggregateUnitsQueryParams,
+): string {
+  const {
+    activationMetric,
+    segment,
+    settings,
+    factTableMap,
+    useUnitsTable,
+    unitsSettings,
+  } = params;
+
+  const experimentDimensions = params.dimensions;
+
+  const exposureQuery = unitsSettings.exposureQuery;
+
+  const isClusterExperiment = !!unitsSettings.isClusterExperiment;
+  const clusterGrain = !!params.clusterGrain && isClusterExperiment;
+
+  const banditDates = getBanditDates(settings.banditSettings);
+  const variationPeriodWeights = getBanditVariationPeriodWeights(
+    settings.banditSettings,
+    settings.variations,
+  );
+
+  const computeBanditSrm = !!banditDates && !!variationPeriodWeights;
+
+  // Units are counted per assignment-query identifier (the cluster column in a
+  // cluster experiment), but the inlined units query is keyed on the sub-unit,
+  // so its identity joins are built from that base, as the units query does.
+  const baseIdType = exposureQuery.identifierType;
+  const unitsBaseIdType =
+    getClusterSubUnit(unitsSettings) ?? exposureQuery.identifierType;
+  const segmentIdType = segment ? segment.userIdType || "user_id" : null;
+  const { idJoinSQL } = getIdentitiesCTE(dialect, datasource.settings, {
+    objects: [
+      [unitsBaseIdType],
+      !useUnitsTable && activationMetric
+        ? getUserIdTypes(activationMetric, factTableMap)
+        : [],
+      !useUnitsTable && segmentIdType && segmentIdType !== baseIdType
+        ? [segmentIdType]
+        : [],
+    ],
+    from: settings.startDate,
+    to: settings.endDate,
+    forcedBaseIdType: unitsBaseIdType,
+    experimentId: settings.experimentId,
+  });
+
+  const unitsSourceName = useUnitsTable
+    ? `${params.unitsTableFullName}`
+    : "__experimentUnits";
+
+  const clusterConsistencyWhere = isClusterExperiment
+    ? `WHERE ${[
+        getSingleClusterPerUnitCondition({ clusterIdColumn: baseIdType }),
+        getConsistentClusterCondition({
+          sourceTable: unitsSourceName,
+          clusterIdColumn: baseIdType,
+        }),
+      ].join(" AND ")}`
+    : "";
+
+  return format(
+    `-- Traffic Query for Health Tab
+    WITH
+      ${idJoinSQL}
+      ${
+        !useUnitsTable
+          ? `${getExperimentUnitsQuery(dialect, datasource, {
+              ...params,
+              includeIdJoins: false,
+            })},`
+          : ""
+      }
+      ${
+        clusterGrain
+          ? `__clusterCollapsedUnits AS (
+        SELECT
+          ${baseIdType}
+          , ${dialect.ifElse(
+            "COUNT(DISTINCT variation) > 1",
+            "'__multiple__'",
+            "MAX(variation)",
+          )} AS variation
+          , MIN(first_exposure_timestamp) AS first_exposure_timestamp
+          ${experimentDimensions
+            .map((d) => `, MAX(dim_exp_${d.id}) AS dim_exp_${d.id}`)
+            .join("\n")}
+          ${
+            activationMetric
+              ? `, MIN(first_activation_timestamp) AS first_activation_timestamp`
+              : ""
+          }
+        FROM ${unitsSourceName}
+        ${clusterConsistencyWhere}
+        GROUP BY ${baseIdType}
+      ),`
+          : ""
+      }
+      __distinctUnits AS (
+        SELECT
+          ${baseIdType}
+          , variation
+          , ${dialect.formatDate(
+            dialect.dateTrunc("first_exposure_timestamp", "day"),
+          )} AS dim_exposure_date
+          ${banditDates ? `${getBanditCaseWhen(dialect, banditDates)}` : ""}
+          ${experimentDimensions
+            .map(
+              (d) =>
+                `, ${getDimensionInStatement(
+                  dialect,
+                  `dim_exp_${d.id}`,
+                  d.specifiedSlices,
+                )} AS dim_exp_${d.id}`,
+            )
+            .join("\n")}
+          ${
+            activationMetric
+              ? `, ${dialect.ifElse(
+                  `first_activation_timestamp IS NULL`,
+                  "'Not Activated'",
+                  "'Activated'",
+                )} AS dim_activated`
+              : ""
+          }
+        FROM ${clusterGrain ? "__clusterCollapsedUnits" : unitsSourceName}
+        ${clusterGrain ? "" : clusterConsistencyWhere}
+      )
+      , __unitsByDimension AS (
+        -- One row per variation per dimension slice
+        ${[
+          "dim_exposure_date",
+          ...experimentDimensions.map((d) => `dim_exp_${d.id}`),
+          ...(activationMetric ? ["dim_activated"] : []),
+        ]
+          .map((d) =>
+            getUnitCountCTE(
+              dialect,
+              d,
+              activationMetric && d !== "dim_activated"
+                ? "WHERE dim_activated = 'Activated'"
+                : "",
+              computeBanditSrm,
+            ),
+          )
+          .join("\nUNION ALL\n")}
+      )
+      ${
+        computeBanditSrm
+          ? `
+        , variationBanditPeriodWeights AS (
+          ${variationPeriodWeights
+            .map(
+              (w) => `
+            SELECT
+              ${dialect.castToString(`'${w.variationId}'`)} AS variation
+              , ${dialect.toTimestamp(w.date)} AS bandit_period
+              , ${w.weight} AS weight
+          `,
+            )
+            .join("\nUNION ALL\n")}
+        )
+        , __unitsByVariationBanditPeriod AS (
+          SELECT
+            v.variation AS variation
+            , v.bandit_period AS bandit_period
+            , v.weight AS weight
+            , COALESCE(COUNT(d.bandit_period), 0) AS units
+          FROM variationBanditPeriodWeights v
+          LEFT JOIN __distinctUnits d
+            ON (d.variation = v.variation AND d.bandit_period = v.bandit_period)
+          GROUP BY
+            v.variation
+            , v.bandit_period
+            , v.weight
+        )
+        , __totalUnitsByBanditPeriod AS (
+          SELECT
+            bandit_period
+            , SUM(units) AS total_units
+          FROM __unitsByVariationBanditPeriod
+          GROUP BY
+            bandit_period
+        )
+        , __expectedUnitsByVariationBanditPeriod AS (
+          SELECT
+            u.variation AS variation
+            , MAX(${dialect.castToString("''")}) AS constant
+            , SUM(u.units) AS units
+            , SUM(t.total_units * u.weight) AS expected_units
+          FROM __unitsByVariationBanditPeriod u
+          LEFT JOIN __totalUnitsByBanditPeriod t
+            ON (t.bandit_period = u.bandit_period)
+          WHERE
+            COALESCE(t.total_units, 0) > 0
+          GROUP BY
+            u.variation
+        )
+        , __banditSrm AS (
+          SELECT
+            MAX(${dialect.castToString("''")}) AS variation
+            , MAX(${dialect.castToString("''")}) AS dimension_value
+            , MAX(${dialect.castToString(
+              `'${BANDIT_SRM_DIMENSION_NAME}'`,
+            )}) AS dimension_name
+            , SUM(POW(expected_units - units, 2) / expected_units) AS units
+          FROM __expectedUnitsByVariationBanditPeriod
+          GROUP BY
+            constant
+        ),
+        __unitsByDimensionWithBanditSrm AS (
+          SELECT
+            *
+          FROM __unitsByDimension
+          UNION ALL
+          SELECT
+            *
+          FROM __banditSrm
+        )
+      `
+          : ""
+      }
+
+      ${dialect.selectStarLimit(
+        computeBanditSrm
+          ? "__unitsByDimensionWithBanditSrm"
+          : "__unitsByDimension",
+        MAX_ROWS_UNIT_AGGREGATE_QUERY,
+      )}
+    `,
+    dialect.formatDialect,
+  );
+}

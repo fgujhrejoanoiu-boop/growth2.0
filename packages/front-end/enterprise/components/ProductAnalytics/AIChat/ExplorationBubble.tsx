@@ -1,0 +1,168 @@
+import React, { useState } from "react";
+import { Flex, Box } from "@radix-ui/themes";
+import { PiSparkle } from "react-icons/pi";
+import {
+  ExplorationConfig,
+  ProductAnalyticsExploration,
+} from "shared/validators";
+import { z } from "zod";
+import { encodeExplorationConfig } from "shared/enterprise";
+import { parseToolResult } from "shared/ai-chat";
+import Text from "@/ui/Text";
+import Button from "@/ui/Button";
+import LinkButton from "@/ui/LinkButton";
+import { AssistantBubble } from "@/enterprise/components/AIChat/AIChatPrimitives";
+import ExplorerChart from "@/enterprise/components/ProductAnalytics/MainSection/ExplorerChart";
+import SimpleExplorationTable from "@/enterprise/components/ProductAnalytics/MainSection/SimpleExplorationTable";
+import SaveToDashboardModal, {
+  canSaveToDashboard,
+} from "@/enterprise/components/ProductAnalytics/SaveToDashboardModal";
+import ExplorerDataTable from "@/enterprise/components/ProductAnalytics/MainSection/ExplorerDataTable";
+import { isTableChartType } from "@/enterprise/components/ProductAnalytics/util";
+
+export interface ChartData {
+  config: ExplorationConfig;
+  exploration: ProductAnalyticsExploration | null;
+}
+
+// Null until that type has an Explorer page.
+const EXPLORER_PATHS: Record<ExplorationConfig["type"], string | null> = {
+  metric: "/product-analytics/explore/metrics",
+  fact_table: "/product-analytics/explore/fact-table",
+  data_source: "/product-analytics/explore/data-source",
+  sql: "/product-analytics/explore/sql",
+  funnel: "/product-analytics/explore/funnel",
+  journey: "/product-analytics/explore/journey",
+  population: null,
+};
+
+export function chartDataFromToolResult(result: unknown): ChartData | null {
+  const record = parseToolResult(result, z.record(z.string(), z.unknown()));
+  return record ? chartDataFromRecord(record) : null;
+}
+
+export function chartDataFromRecord(
+  data: Record<string, unknown>,
+): ChartData | null {
+  const exploration =
+    (data.exploration as ProductAnalyticsExploration | null) ?? null;
+  let config = data.config as ExplorationConfig | undefined;
+  if ((!config || typeof config !== "object") && exploration?.config) {
+    config = exploration.config as ExplorationConfig;
+  }
+  if (!config || typeof config !== "object") return null;
+  return { config, exploration };
+}
+
+interface ExplorationBubbleProps {
+  chartData: ChartData;
+  toolTransparency?: React.ReactNode;
+  animate?: boolean;
+  compact?: boolean;
+  showSaveAction?: boolean;
+}
+
+export default function ExplorationBubble({
+  chartData,
+  toolTransparency,
+  animate = true,
+  compact = false,
+  showSaveAction = true,
+}: ExplorationBubbleProps) {
+  const [showSaveModal, setShowSaveModal] = useState(false);
+  const explorerPath = EXPLORER_PATHS[chartData.config.type];
+  const explorerUrl = explorerPath
+    ? `${explorerPath}?config=${encodeExplorationConfig(chartData.config)}`
+    : null;
+  const isTable = isTableChartType(chartData.config.chartType);
+
+  return (
+    <AssistantBubble variant="artifact">
+      {showSaveModal && (
+        <SaveToDashboardModal
+          close={() => setShowSaveModal(false)}
+          config={chartData.config}
+          exploration={chartData.exploration}
+        />
+      )}
+      <Flex align="center" gap="2" mb="2" wrap="wrap" style={{ minWidth: 0 }}>
+        <Flex align="center" gap="2" style={{ minWidth: 0 }}>
+          <PiSparkle size={12} style={{ flexShrink: 0 }} />
+          <Text size="sm" weight="medium" truncate>
+            {isTable ? "Generated table" : "Generated chart"}
+          </Text>
+        </Flex>
+        <Flex ml="auto" gap="1" wrap="wrap">
+          {showSaveAction &&
+            canSaveToDashboard(chartData.config.dataset.type) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                color="violet"
+                onClick={() => setShowSaveModal(true)}
+              >
+                Save to Dashboard
+              </Button>
+            )}
+          {explorerUrl && (
+            <LinkButton
+              href={explorerUrl}
+              variant="ghost"
+              size="sm"
+              color="violet"
+            >
+              Open in Explorer
+            </LinkButton>
+          )}
+        </Flex>
+      </Flex>
+      {chartData.config.chartType === "rawTable" ? (
+        <Flex
+          style={{
+            height: compact ? 280 : 360,
+            minHeight: compact ? 240 : 260,
+            minWidth: 0,
+            width: "100%",
+            overflow: "hidden",
+          }}
+        >
+          <ExplorerDataTable
+            exploration={chartData.exploration}
+            error={chartData.exploration?.error ?? null}
+            submittedExploreState={chartData.config}
+            loading={false}
+          />
+        </Flex>
+      ) : isTable ? (
+        <SimpleExplorationTable
+          exploration={chartData.exploration}
+          config={chartData.config}
+          maxHeight={compact ? 240 : 360}
+        />
+      ) : (
+        <Flex
+          style={{
+            height: compact ? 280 : 360,
+            minHeight: compact ? 240 : 260,
+            minWidth: 0,
+            width: "100%",
+            overflow: "hidden",
+          }}
+        >
+          <ExplorerChart
+            exploration={chartData.exploration}
+            error={chartData.exploration?.error ?? null}
+            submittedExploreState={chartData.config}
+            loading={false}
+            animate={animate}
+          />
+        </Flex>
+      )}
+      {toolTransparency ? (
+        <Box mt="2" pt="2" style={{ borderTop: "1px solid var(--gray-a5)" }}>
+          {toolTransparency}
+        </Box>
+      ) : null}
+    </AssistantBubble>
+  );
+}

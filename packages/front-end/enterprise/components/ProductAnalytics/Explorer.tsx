@@ -1,0 +1,682 @@
+import React, { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/router";
+import { Flex, Box, AlertDialog } from "@radix-ui/themes";
+import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { PiDotsSix } from "react-icons/pi";
+import {
+  ComparisonMode,
+  DatasetType,
+  datasetTypeHasValues,
+  ExplorationConfig,
+  ExplorationDateRange,
+} from "shared/validators";
+import { DEFAULT_EXPLORE_STATE } from "shared/enterprise";
+import { isFactFunnelMetric } from "shared/experiments";
+import {
+  deriveFunnelUnit,
+  funnelSettingsToFunnelDataset,
+} from "shared/funnels";
+import { parseAsString, useQueryState } from "nuqs";
+import { NuqsAdapter } from "nuqs/adapters/next/pages";
+import ShadowedScrollArea from "@/components/ShadowedScrollArea/ShadowedScrollArea";
+import LoadingOverlay from "@/components/LoadingOverlay";
+import Button from "@/ui/Button";
+import { Tabs, TabsList, TabsTrigger } from "@/ui/Tabs";
+import Tooltip from "@/components/Tooltip/Tooltip";
+import ManagedWarehouseNoEventsCallout from "@/components/ManagedWarehouse/ManagedWarehouseNoEventsCallout";
+import { useDefinitions } from "@/services/DefinitionsContext";
+import EmptyState from "./EmptyState";
+import ExplorerSideBar from "./SideBar/ExplorerSideBar";
+import SaveFunnelMetricAction from "./SideBar/SaveFunnelMetricAction";
+import {
+  ExplorerProvider,
+  useExplorerContext,
+  useDefaultDataSourceId,
+} from "./ExplorerContext";
+import ExplorerMainSection from "./MainSection/ExplorerMainSection";
+import DataSourceDropdown from "./MainSection/Toolbar/DataSourceDropdown";
+import ExplorerPageActions from "./ExplorerPageActions";
+import { useOptionalSqlEditorContext } from "./SqlEditorContext";
+import {
+  createEmptyDataset,
+  createEmptyValue,
+  decodeExplorationConfig,
+  explorationConfigParser,
+  ExplorerDraftConfig,
+  getInitialInlineFilters,
+  previousTimeFrameQueryParser,
+  comparisonModeQueryParser,
+  stripExplorerDraftFields,
+} from "./util";
+import { EXPLORER_AUTO_RUN_QUERY } from "./journeyFunnel";
+import styles from "./Explorer.module.scss";
+
+const EXPLORER_TYPE_LABELS: Record<DatasetType, string> = {
+  metric: "Metric",
+  fact_table: "Fact Table",
+  data_source: "Data Source",
+  sql: "SQL",
+  funnel: "Funnel",
+  journey: "User Journey",
+  population: "Population",
+};
+
+const explorationQueryParser = explorationConfigParser.withOptions({
+  shallow: true,
+  throttleMs: 300,
+});
+
+const previousTimeFrameParser = previousTimeFrameQueryParser.withOptions({
+  shallow: true,
+  throttleMs: 0,
+});
+
+const comparisonModeParser = comparisonModeQueryParser.withOptions({
+  shallow: true,
+  throttleMs: 0,
+});
+
+// Which funnel metric the exploration was opened from. Kept as its own param
+// rather than inside `?config=`: the funnel dataset schema is `.strict()` and
+// also validates dashboard blocks and persisted runs, so adding a field there
+// would ripple well beyond the explorer.
+const funnelMetricIdParser = parseAsString.withOptions({
+  shallow: true,
+  throttleMs: 0,
+});
+
+function deriveConfigError(
+  urlConfig: ExplorationConfig | null,
+  rawParam: string | undefined,
+  type: DatasetType,
+  lockedDatasourceId?: string,
+): string | null {
+  if (!rawParam) return null;
+
+  if (!urlConfig) {
+    const result = decodeExplorationConfig(rawParam);
+    return result.error;
+  }
+
+  if (urlConfig.type !== type) {
+    return `This link was created from the ${
+      EXPLORER_TYPE_LABELS[urlConfig.type]
+    } explorer, but you're currently viewing the ${
+      EXPLORER_TYPE_LABELS[type]
+    } explorer.`;
+  }
+
+  // The selector that would reveal a mismatch is hidden here, so a saved
+  // config for another Data Source would otherwise silently win.
+  if (lockedDatasourceId && urlConfig.datasource !== lockedDatasourceId) {
+    return "This link was created from a different Data Source.";
+  }
+
+  return null;
+}
+
+export function ExplorerContent({
+  // Less the page's own padding above and below it (--explorer-frame-y).
+  height = "calc(100vh - var(--page-top-offset) - var(--explorer-frame-y, 16px))",
+  hideDataSourceSelector = false,
+  hideSidebarHeaderActions = false,
+  sidebarHeaderActions,
+}: {
+  height?: string;
+  hideDataSourceSelector?: boolean;
+  hideSidebarHeaderActions?: boolean;
+  sidebarHeaderActions?: React.ReactNode;
+}) {
+  const {
+    managedWarehouseUnavailable,
+    draftExploreState,
+    ensureDefaultSqlExploreConfig,
+  } = useExplorerContext();
+  const sqlEditorContext = useOptionalSqlEditorContext();
+  const isSql = draftExploreState.type === "sql";
+  const isFunnel = draftExploreState.type === "funnel";
+
+  const explorerBody = (
+    <PanelGroup direction="horizontal">
+      <Panel
+        id="main-section"
+        order={1}
+        defaultSize={75}
+        minSize={65}
+        style={{ display: "flex", flexDirection: "column" }}
+      >
+        <ExplorerMainSection
+          showDataSourceSelector={!hideDataSourceSelector && !isSql}
+        />
+      </Panel>
+
+      <PanelResizeHandle
+        style={{
+          width: "10px",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Box
+          flexGrow="1"
+          mb="3"
+          mt={isSql ? "3" : "9"}
+          style={{ backgroundColor: "var(--gray-a3)", width: "1px" }}
+        ></Box>
+        <PiDotsSix size={16} style={{ transform: "rotate(90deg)" }} />
+        <Box
+          flexGrow="1"
+          mt="3"
+          style={{
+            backgroundColor: "var(--gray-a3)",
+            width: "1px",
+            marginBottom: "var(--explorer-page-bottom, 12px)",
+          }}
+        ></Box>
+      </PanelResizeHandle>
+
+      <Panel id="sidebar" order={2} defaultSize={25} minSize={20}>
+        <Flex
+          direction="column"
+          height="100%"
+          // SQL's schema browser already ends 24px up, inside the sidebar.
+          style={{
+            paddingBottom: isSql ? undefined : "var(--explorer-page-bottom)",
+          }}
+        >
+          <Box style={{ flex: 1, minHeight: 0 }}>
+            <ShadowedScrollArea height="100%">
+              <ExplorerSideBar
+                hideHeaderActions={hideSidebarHeaderActions || isSql}
+                headerActions={sidebarHeaderActions}
+              />
+            </ShadowedScrollArea>
+          </Box>
+          {isFunnel && (
+            <Box
+              p="2"
+              style={{
+                borderTop: "1px solid var(--gray-a3)",
+              }}
+            >
+              <SaveFunnelMetricAction />
+            </Box>
+          )}
+        </Flex>
+      </Panel>
+    </PanelGroup>
+  );
+
+  return (
+    <Flex direction="column" gap="3" height={height}>
+      {managedWarehouseUnavailable ? (
+        <Box px="2">
+          <ManagedWarehouseNoEventsCallout />
+        </Box>
+      ) : null}
+      {isSql && sqlEditorContext ? (
+        <>
+          <Flex direction="column" gap="1" px="2" flexShrink="0">
+            {!hideDataSourceSelector ? (
+              <Flex align="center" height="32px" mt="1">
+                <DataSourceDropdown />
+              </Flex>
+            ) : null}
+          </Flex>
+          <Tabs
+            value={sqlEditorContext.viewMode}
+            onValueChange={(value) => {
+              if (value === "dataset" || value === "explore") {
+                if (value === "explore") {
+                  ensureDefaultSqlExploreConfig();
+                  sqlEditorContext.markExploreSeen();
+                }
+                sqlEditorContext.setViewMode(value);
+              }
+            }}
+            style={{
+              flex: 1,
+              minHeight: 0,
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
+            <Flex
+              align="center"
+              justify="between"
+              flexShrink="0"
+              px="2"
+              style={{
+                width: "100%",
+                borderBottom: "1px solid var(--gray-a5)",
+              }}
+            >
+              <TabsList
+                style={{
+                  boxShadow: "none",
+                }}
+                size="lg"
+              >
+                <TabsTrigger value="dataset">Build Dataset</TabsTrigger>
+                <Tooltip
+                  body="Write or generate a query to build your dataset. Then you can explore the results and build visualizations with the data."
+                  shouldDisplay={!sqlEditorContext.exploreReady}
+                >
+                  <span style={{ display: "inline-flex" }}>
+                    <TabsTrigger
+                      value="explore"
+                      disabled={!sqlEditorContext.exploreReady}
+                    >
+                      <Flex align="center" gap="2">
+                        Explore Dataset
+                        {sqlEditorContext.exploreReady &&
+                        !sqlEditorContext.hasSeenExplore ? (
+                          <span
+                            className={styles.readyDot}
+                            aria-label="Sample results ready"
+                          >
+                            <span className={styles.readyDotPing} aria-hidden />
+                          </span>
+                        ) : null}
+                      </Flex>
+                    </TabsTrigger>
+                  </span>
+                </Tooltip>
+              </TabsList>
+              <Flex align="center" gap="2">
+                {!hideSidebarHeaderActions && !sidebarHeaderActions ? (
+                  <ExplorerPageActions />
+                ) : (
+                  sidebarHeaderActions
+                )}
+              </Flex>
+            </Flex>
+            <Box style={{ flex: 1, minHeight: 0 }}>{explorerBody}</Box>
+          </Tabs>
+        </>
+      ) : (
+        explorerBody
+      )}
+    </Flex>
+  );
+}
+
+function ExplorerUrlSync({
+  setUrlConfig,
+}: {
+  setUrlConfig: (config: ExplorationConfig) => void;
+}) {
+  const { draftExploreState } = useExplorerContext();
+  const hasUserModified = useRef(false);
+
+  useEffect(() => {
+    if (!hasUserModified.current) {
+      hasUserModified.current = true;
+      return;
+    }
+    setUrlConfig(stripExplorerDraftFields(draftExploreState));
+  }, [draftExploreState, setUrlConfig]);
+
+  return null;
+}
+
+/** Mirrors the linked funnel metric into `?funnelMetricId=` so a refresh or a
+ *  shared link keeps it. Same shape as the other URL syncs: the first effect
+ *  pass is skipped so mounting doesn't immediately rewrite the URL. */
+function ExplorerFunnelMetricUrlSync({
+  setUrlFunnelMetricId,
+}: {
+  setUrlFunnelMetricId: (value: string | null) => void;
+}) {
+  const { linkedFunnelMetricId } = useExplorerContext();
+  const hasUserModified = useRef(false);
+
+  useEffect(() => {
+    if (!hasUserModified.current) {
+      hasUserModified.current = true;
+      return;
+    }
+    void setUrlFunnelMetricId(linkedFunnelMetricId);
+  }, [linkedFunnelMetricId, setUrlFunnelMetricId]);
+
+  return null;
+}
+
+function ExplorerPreviousTimeFrameUrlSync({
+  setUrlPreviousTimeFrame,
+  setUrlComparisonMode,
+}: {
+  setUrlPreviousTimeFrame: (value: ExplorationDateRange | null) => void;
+  setUrlComparisonMode: (value: ComparisonMode | null) => void;
+}) {
+  const { draftExploreState, compareEnabled, comparisonMode } =
+    useExplorerContext();
+  const hasUserModified = useRef(false);
+
+  useEffect(() => {
+    if (!hasUserModified.current) {
+      hasUserModified.current = true;
+      return;
+    }
+    void setUrlPreviousTimeFrame(draftExploreState.previousTimeFrame ?? null);
+    void setUrlComparisonMode(compareEnabled ? comparisonMode : null);
+  }, [
+    draftExploreState.previousTimeFrame,
+    compareEnabled,
+    comparisonMode,
+    setUrlPreviousTimeFrame,
+    setUrlComparisonMode,
+  ]);
+
+  return null;
+}
+
+export default function Explorer({
+  type,
+  datasourceId,
+  lockDatasource = false,
+  height,
+  sidebarHeaderActions,
+}: {
+  type: DatasetType;
+  datasourceId?: string;
+  lockDatasource?: boolean;
+  height?: string;
+  sidebarHeaderActions?: React.ReactNode;
+}) {
+  return (
+    <NuqsAdapter>
+      <ExplorerInner
+        type={type}
+        datasourceId={datasourceId}
+        lockDatasource={lockDatasource}
+        height={height}
+        sidebarHeaderActions={sidebarHeaderActions}
+      />
+    </NuqsAdapter>
+  );
+}
+
+function ExplorerInner({
+  type,
+  datasourceId: lockedDatasourceId,
+  lockDatasource = false,
+  height,
+  sidebarHeaderActions,
+}: {
+  type: DatasetType;
+  datasourceId?: string;
+  lockDatasource?: boolean;
+  height?: string;
+  sidebarHeaderActions?: React.ReactNode;
+}) {
+  const router = useRouter();
+  const defaultDataSourceId = useDefaultDataSourceId();
+  const {
+    ready,
+    datasources,
+    getFactMetricById,
+    getFactTableById,
+    getDatasourceById,
+  } = useDefinitions();
+
+  const [urlConfig, setUrlConfig] = useQueryState(
+    "config",
+    explorationQueryParser,
+  );
+
+  const [urlPreviousTimeFrame, setUrlPreviousTimeFrame] = useQueryState(
+    "previousTimeFrame",
+    previousTimeFrameParser,
+  );
+
+  const [urlComparisonMode, setUrlComparisonMode] = useQueryState(
+    "comparisonMode",
+    comparisonModeParser,
+  );
+
+  const [, setUrlFunnelMetricId] = useQueryState(
+    "funnelMetricId",
+    funnelMetricIdParser,
+  );
+
+  const getQueryParam = (value: string | string[] | undefined) =>
+    Array.isArray(value) ? value[0] : value;
+  const rawParam = getQueryParam(router.query.config);
+  const metricId = getQueryParam(router.query.metricId);
+  const factTableId = getQueryParam(router.query.factTableId);
+  const datasourceId =
+    lockedDatasourceId ?? getQueryParam(router.query.datasourceId);
+  const funnelMetricId = getQueryParam(router.query.funnelMetricId);
+  const seedId =
+    type === "metric"
+      ? metricId
+      : type === "fact_table"
+        ? factTableId
+        : type === "funnel"
+          ? funnelMetricId
+          : datasourceId;
+
+  const configError = deriveConfigError(
+    urlConfig,
+    rawParam,
+    type,
+    lockDatasource ? lockedDatasourceId : undefined,
+  );
+
+  const [configErrorModal, setConfigErrorModal] = useState<string | null>(
+    () => configError,
+  );
+
+  // Funnels/journeys seed their own shape in createEmptyDataset. SQL starts
+  // without a value so running raw SQL does not also trigger an exploration
+  // query. Those types also don't start with a date dimension.
+  const defaultDataset = createEmptyDataset(type);
+  const seedsValues = datasetTypeHasValues(type) && type !== "sql";
+  const defaultDraftState = {
+    ...DEFAULT_EXPLORE_STATE,
+    type,
+    datasource: defaultDataSourceId,
+    dataset: seedsValues
+      ? { ...defaultDataset, values: [createEmptyValue(type)] }
+      : defaultDataset,
+    ...(seedsValues ? {} : { dimensions: [] }),
+    ...(type === "journey"
+      ? { chartType: "bar" as const }
+      : type === "sql"
+        ? { chartType: "rawTable" as const }
+        : {}),
+  } as ExplorerDraftConfig;
+
+  let seedError: string | null = null;
+  let seededConfig: ExplorerDraftConfig | null = null;
+
+  if (!rawParam) {
+    if (type === "funnel" && funnelMetricId) {
+      const metric = getFactMetricById(funnelMetricId);
+      if (metric && isFactFunnelMetric(metric)) {
+        seededConfig = {
+          ...defaultDraftState,
+          datasource: metric.datasource,
+          dataset: funnelSettingsToFunnelDataset(
+            metric.funnelSettings,
+            // No prior unit to honour on a fresh load, so take the first that
+            // exists on every step's fact table.
+            deriveFunnelUnit({
+              steps: metric.funnelSettings.steps,
+              getFactTable: (id) => getFactTableById(id) ?? undefined,
+            }),
+          ),
+        } as ExplorerDraftConfig;
+      } else if (ready) {
+        seedError = metric
+          ? "That metric isn't a funnel metric."
+          : "Could not find the requested funnel metric.";
+      }
+    } else if (type === "metric" && metricId) {
+      const metric = getFactMetricById(metricId);
+      if (metric?.metricType === "funnel") {
+        // The metric explorer genuinely can't render a funnel — this guard
+        // stays. Point at the funnel builder rather than dead-ending, since
+        // funnels are now explorable there.
+        seedError =
+          "Funnel metrics open in the Funnel Builder, not the Metric Explorer.";
+      } else if (metric) {
+        seededConfig = {
+          ...defaultDraftState,
+          datasource: metric.datasource,
+          dataset: {
+            ...createEmptyDataset("metric"),
+            values: [
+              {
+                ...createEmptyValue("metric"),
+                metricId: metric.id,
+                name: metric.name,
+              },
+            ],
+          },
+        } as ExplorerDraftConfig;
+      } else if (ready) {
+        seedError = "Could not find the requested Fact Metric.";
+      }
+    } else if (type === "fact_table" && factTableId) {
+      const factTable = getFactTableById(factTableId);
+      if (factTable) {
+        seededConfig = {
+          ...defaultDraftState,
+          datasource: factTable.datasource,
+          dataset: {
+            ...createEmptyDataset("fact_table"),
+            factTableId: factTable.id,
+            values: [
+              {
+                ...createEmptyValue("fact_table"),
+                rowFilters: getInitialInlineFilters(factTable),
+              },
+            ],
+          },
+        } as ExplorerDraftConfig;
+      } else if (ready) {
+        seedError = "Could not find the requested Fact Table.";
+      }
+    } else if ((type === "data_source" || type === "sql") && datasourceId) {
+      const datasource = getDatasourceById(datasourceId);
+      if (datasource) {
+        seededConfig = {
+          ...defaultDraftState,
+          datasource: datasource.id,
+        };
+      } else if (ready) {
+        seedError = "Could not find the requested Data Source.";
+      }
+    }
+  }
+
+  const restorationError = configError ?? seedError;
+
+  useEffect(() => {
+    if (restorationError) {
+      setConfigErrorModal(restorationError);
+    }
+  }, [restorationError]);
+
+  if (!router.isReady || !ready) {
+    return <LoadingOverlay />;
+  }
+
+  const baseConfig =
+    urlConfig && !configError ? urlConfig : (seededConfig ?? defaultDraftState);
+  const initialConfig: ExplorerDraftConfig = {
+    ...baseConfig,
+    // A rejected config skips seeding
+    ...(lockDatasource && lockedDatasourceId
+      ? { datasource: lockedDatasourceId }
+      : {}),
+    ...(urlPreviousTimeFrame
+      ? {
+          previousTimeFrame: urlPreviousTimeFrame,
+          // Links shared before named modes existed carry no mode; the context
+          // falls back to the legacy reading of the primary range.
+          ...(urlComparisonMode ? { comparisonMode: urlComparisonMode } : {}),
+        }
+      : {}),
+  };
+
+  return (
+    <>
+      {configErrorModal && (
+        <AlertDialog.Root open>
+          <AlertDialog.Content maxWidth="480px">
+            <AlertDialog.Title>
+              Unable to restore configuration
+            </AlertDialog.Title>
+            <AlertDialog.Description>
+              {configErrorModal} The explorer has been loaded with default
+              settings.
+            </AlertDialog.Description>
+            <Flex justify="end" mt="4">
+              <Button color="violet" onClick={() => setConfigErrorModal(null)}>
+                Dismiss
+              </Button>
+            </Flex>
+          </AlertDialog.Content>
+        </AlertDialog.Root>
+      )}
+      <ExplorerProvider
+        key={`${type}:${seedId ?? ""}`}
+        initialConfig={initialConfig}
+        // Read even when `?config=` wins for the funnel definition: a shared
+        // link must reproduce the sender's steps *and* remember which metric
+        // they came from, so the dirty flag can say whether they were edited.
+        initialLinkedFunnelMetricId={
+          type === "funnel" ? (funnelMetricId ?? null) : null
+        }
+        autoSubmitOnLoad={
+          type === "funnel" &&
+          getQueryParam(router.query[EXPLORER_AUTO_RUN_QUERY]) === "1"
+        }
+        trackingSource="manual-explorer"
+      >
+        {datasources.length === 0 ? (
+          <Flex
+            direction="column"
+            height="calc(100vh - var(--page-top-offset) - var(--explorer-frame-y, 16px))"
+          >
+            <EmptyState />
+          </Flex>
+        ) : (
+          <>
+            <ExplorerUrlSync setUrlConfig={setUrlConfig} />
+            {type === "funnel" && (
+              <ExplorerFunnelMetricUrlSync
+                setUrlFunnelMetricId={setUrlFunnelMetricId}
+              />
+            )}
+            <ExplorerPreviousTimeFrameUrlSync
+              setUrlPreviousTimeFrame={setUrlPreviousTimeFrame}
+              setUrlComparisonMode={setUrlComparisonMode}
+            />
+            {/* The page's 32px bottom under the card, the sidebar and the
+                line between them: the frame ends 8px above the window. */}
+            <div
+              style={
+                {
+                  display: "contents",
+                  "--explorer-page-bottom": "24px",
+                } as React.CSSProperties
+              }
+            >
+              <ExplorerContent
+                hideDataSourceSelector={lockDatasource}
+                height={height}
+                sidebarHeaderActions={sidebarHeaderActions}
+              />
+            </div>
+          </>
+        )}
+      </ExplorerProvider>
+    </>
+  );
+}

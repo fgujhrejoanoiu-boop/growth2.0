@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+ARG NODE_VERSION=24.22.3
+ARG PYTHON_VERSION=3.11
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS stats
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN python -m venv "$VIRTUAL_ENV"
+WORKDIR /build/stats
+COPY packages/stats/pyproject.toml packages/stats/poetry.lock packages/stats/README.md ./
+COPY packages/stats/gbstats ./gbstats
+RUN pip install --no-cache-dir --target /opt/poetry poetry==1.8.5 \
+    && PYTHONPATH=/opt/poetry python -m poetry install --only main --no-root --no-interaction --no-ansi \
+    && PYTHONPATH=/opt/poetry python -m poetry build --format wheel \
+    && pip install --no-cache-dir --no-deps dist/*.whl \
+    && pip install --no-cache-dir ddtrace==4.16.1
+
+FROM node:${NODE_VERSION}-bookworm-slim AS app
+WORKDIR /usr/local/src/app
+ARG NODE_OPTIONS=--max-old-space-size=6144
+ENV NODE_OPTIONS="$NODE_OPTIONS" \
+    NEXT_TELEMETRY_DISABLED=1 \
+    CI=true
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3 ca-certificates libkrb5-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global pnpm@10.33.4
+COPY . .
+RUN GB_SKIP_PREPARE=1 MONGOMS_DISABLE_POSTINSTALL=1 pnpm install --frozen-lockfile \
+    && pnpm build:deps \
+    && pnpm --workspace-concurrency=1 --filter back-end --filter front-end run build \
+    && rm -rf packages/front-end/.next/cache \
+    && mkdir -p packages/back-end/uploads
+
+FROM python:${PYTHON_VERSION}-slim-bookworm
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgssapi-krb5-2 libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --create-home growthbook
+WORKDIR /usr/local/src/app
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH" \
+    NODE_ENV=production \
+    NODE_OPTIONS=--no-node-snapshot \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NEXT_TELEMETRY_DISABLED=1
+COPY --from=stats /opt/venv /opt/venv
+COPY --from=app /usr/local/bin/node /usr/local/bin/node
+COPY --from=app --chown=growthbook:growthbook /usr/local/src/app ./
+USER growthbook
+EXPOSE 3000 3100
+CMD ["node", "scripts/run-apps.js", "start", "ecosystem.config.js"]

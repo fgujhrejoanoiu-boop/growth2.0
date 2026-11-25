@@ -1,0 +1,222 @@
+import {
+  NULL_ATTRIBUTE_VALUE,
+  CONTEXTUAL_BANDIT_COMBINED_ATTRIBUTE_VALUE,
+} from "shared/constants";
+import {
+  contextualBanditAttrCol,
+  contextualBanditRawAttrCol,
+} from "shared/experiments";
+import type {
+  DimensionColumnData,
+  ExperimentUnitsQuerySettings,
+} from "shared/types/integrations";
+import type { SqlDialect } from "shared/types/sql";
+import {
+  formatMalformedTargetingAttributeColumnMessages,
+  isSafeSqlIdentifier,
+  CONTEXTUAL_BANDIT_EAQ_BANDIT_VERSION_COLUMN,
+} from "shared/validators";
+import { concatSql } from "back-end/src/integrations/sql/primitives/concat";
+
+export const CONTEXTUAL_BANDIT_UNIT_BANDIT_VERSION_COLUMN =
+  "__cb_bandit_version";
+
+type ContextualBanditTargetingSettings = Pick<
+  ExperimentUnitsQuerySettings,
+  "banditSettings" | "variations"
+>;
+
+// @todo(contextual-bandits): fine tune by dialect
+const MAX_CONTEXTUAL_BANDIT_CONTEXTS = 5000;
+
+export function appendContextualBanditTargetingAttributeCols(
+  dimensionCols: DimensionColumnData[],
+  settings: ContextualBanditTargetingSettings,
+): void {
+  const cfg = getContextualBanditUnitsSqlConfig(settings);
+  if (!cfg) {
+    return;
+  }
+  for (const a of cfg.aliases) {
+    const col = contextualBanditAttrCol(a);
+    dimensionCols.push({
+      alias: col,
+      value: col,
+    });
+  }
+}
+
+/** Last-line SQL-injection guard: throws on unsafe column identifiers rather than dropping silently. */
+export function assertSafeTargetingSqlIdentifiers(columns: string[]): string[] {
+  const unsafe = columns.filter((c) => !isSafeSqlIdentifier(c));
+  if (unsafe.length > 0) {
+    throw new Error(formatMalformedTargetingAttributeColumnMessages(unsafe));
+  }
+  return columns;
+}
+
+export type ContextualBanditUnitsSqlConfig = {
+  aliases: string[];
+  maxRankedContexts: number;
+  periodWeighting: boolean;
+};
+
+export function getContextualBanditUnitsSqlConfig(
+  settings: ContextualBanditTargetingSettings,
+): ContextualBanditUnitsSqlConfig | null {
+  const bs = settings.banditSettings;
+  if (!bs?.contextualBandit) {
+    return null;
+  }
+  const columns = bs.targetingAttributeColumns ?? [];
+  if (!columns.length) {
+    return null;
+  }
+  const aliases = assertSafeTargetingSqlIdentifiers(columns);
+  const k = Math.max(1, settings.variations?.length ?? 1);
+  const maxRankedContexts = Math.max(
+    1,
+    Math.floor(MAX_CONTEXTUAL_BANDIT_CONTEXTS / k) - 1,
+  );
+  return {
+    aliases,
+    maxRankedContexts,
+    periodWeighting: !!bs.periodWeighting,
+  };
+}
+
+/** True when the CB has at least one targeting column and can segment users into distinct contexts. */
+export function hasUsableContextualBanditTargeting(
+  settings: ContextualBanditTargetingSettings,
+): boolean {
+  const bs = settings.banditSettings;
+  if (!bs?.contextualBandit) {
+    return true;
+  }
+  return (bs.targetingAttributeColumns ?? []).length > 0;
+}
+
+/** Pass-through columns from __rawExperiment for contextual bandit targeting attributes. */
+export function getContextualBanditExposureSelectCols(
+  aliases: string[],
+  periodWeighting = false,
+): string {
+  return (
+    aliases.map((a) => `, e.${a}`).join("") +
+    (periodWeighting
+      ? `, e.${CONTEXTUAL_BANDIT_EAQ_BANDIT_VERSION_COLUMN}`
+      : "")
+  );
+}
+
+/** First-exposure targeting attribute on __experimentUnitsBase (same pattern as experiment dimensions). */
+export function getAttributeValuePerUnit(
+  dialect: SqlDialect,
+  alias: string,
+  timestampColumn: string,
+): string {
+  return `SUBSTRING(
+        MIN(
+          ${concatSql(
+            `SUBSTRING(${dialect.formatDateTimeString(timestampColumn)}, 1, 19)`,
+            `coalesce(${dialect.castToString(
+              `e.${alias}`,
+            )}, ${dialect.castToString(`'${NULL_ATTRIBUTE_VALUE}'`)})`,
+          )}
+        ),
+        20,
+        99999
+      )`;
+}
+
+export function getContextualBanditUnitsBaseColumns(
+  dialect: SqlDialect,
+  aliases: string[],
+  timestampColumn: string,
+): { alias: string; expr: string }[] {
+  return aliases.map((a) => ({
+    alias: contextualBanditRawAttrCol(a),
+    expr: getAttributeValuePerUnit(dialect, a, timestampColumn),
+  }));
+}
+
+/** First-exposure bandit_version becomes each unit's period (bandit_period). */
+export function getContextualBanditUnitVersionColumn(
+  dialect: SqlDialect,
+  timestampColumn: string,
+): { alias: string; expr: string } {
+  return {
+    alias: CONTEXTUAL_BANDIT_UNIT_BANDIT_VERSION_COLUMN,
+    expr: getAttributeValuePerUnit(
+      dialect,
+      CONTEXTUAL_BANDIT_EAQ_BANDIT_VERSION_COLUMN,
+      timestampColumn,
+    ),
+  };
+}
+
+/** CTEs after __experimentUnitsBase: context-tuple counts, top-N bucketing, final __experimentUnits. */
+export function getContextualBanditUnitsCTEs(
+  dialect: SqlDialect,
+  {
+    aliases,
+    maxRankedContexts,
+    unitsBaseCteName,
+    baseColumnRefs,
+  }: {
+    aliases: string[];
+    maxRankedContexts: number;
+    unitsBaseCteName: string;
+    baseColumnRefs: string;
+  },
+): string {
+  const ctxGroupBy = aliases
+    .map((a) => contextualBanditRawAttrCol(a))
+    .join(", ");
+  const joinOnMapped = aliases
+    .map(
+      (a) =>
+        `u.${contextualBanditRawAttrCol(a)} = cc.${contextualBanditRawAttrCol(a)}`,
+    )
+    .join(" AND ");
+  const keepContextExpr = `COALESCE(cc.__attr_cb_ctx_rn, 999999999) <= ${maxRankedContexts}`;
+  const caseCols = aliases
+    .map(
+      (a) => `
+    , ${dialect.ifElse(
+      keepContextExpr,
+      `u.${contextualBanditRawAttrCol(a)}`,
+      dialect.castToString(`'${CONTEXTUAL_BANDIT_COMBINED_ATTRIBUTE_VALUE}'`),
+    )} AS ${contextualBanditAttrCol(a)}`,
+    )
+    .join("");
+
+  return `
+    , __contextCounts AS (
+      SELECT
+        ${ctxGroupBy}
+        , COUNT(*) AS __attr_cb_user_cnt
+      FROM
+        ${unitsBaseCteName}
+      GROUP BY
+        ${ctxGroupBy}
+    )
+    , __contextCountsRanked AS (
+      SELECT
+        ${ctxGroupBy}
+        , __attr_cb_user_cnt
+        , ROW_NUMBER() OVER (ORDER BY __attr_cb_user_cnt DESC) AS __attr_cb_ctx_rn
+      FROM
+        __contextCounts
+    )
+    , __experimentUnits AS (
+      SELECT
+        ${baseColumnRefs}
+        ${caseCols}
+      FROM
+        ${unitsBaseCteName} u
+      LEFT JOIN __contextCountsRanked cc ON (
+        ${joinOnMapped}
+      )
+    )`;
+}

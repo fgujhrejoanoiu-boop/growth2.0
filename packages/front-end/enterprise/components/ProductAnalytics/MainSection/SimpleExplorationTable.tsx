@@ -1,0 +1,119 @@
+import { Flex, Box } from "@radix-ui/themes";
+import type {
+  ExplorationConfig,
+  ProductAnalyticsExploration,
+} from "shared/validators";
+import { isManagedWarehousePendingQueryError } from "shared/util";
+import Text from "@/ui/Text";
+import ManagedWarehouseNoEventsCallout from "@/components/ManagedWarehouse/ManagedWarehouseNoEventsCallout";
+import { formatExplorationTableCell } from "@/enterprise/components/ProductAnalytics/util";
+import useExplorationTableData from "./useExplorationTableData";
+import styles from "./SimpleExplorationTable.module.scss";
+
+export default function SimpleExplorationTable({
+  exploration,
+  config,
+  maxHeight = 360,
+}: {
+  exploration: ProductAnalyticsExploration | null;
+  config: ExplorationConfig;
+  maxHeight?: number;
+}) {
+  const {
+    rowData,
+    orderedColumnKeys,
+    columnLabels,
+    headerStructure,
+    explorationReturnedNoData,
+    columnFormats,
+  } = useExplorationTableData(exploration, config);
+
+  if (exploration?.error) {
+    if (isManagedWarehousePendingQueryError(exploration.error)) {
+      return <ManagedWarehouseNoEventsCallout />;
+    }
+    return (
+      <Text size="sm" color="text-low">
+        {exploration.error}
+      </Text>
+    );
+  }
+
+  if (explorationReturnedNoData) {
+    return (
+      <Text size="sm" color="text-low">
+        The query ran successfully, but no data was returned.
+      </Text>
+    );
+  }
+
+  const useTwoRowHeader = headerStructure != null;
+
+  return (
+    <Box
+      style={{
+        maxHeight,
+        overflow: "auto",
+        borderRadius: "var(--radius-2)",
+        border: "1px solid var(--gray-a4)",
+      }}
+    >
+      <Flex align="center" gap="2" px="3" py="2">
+        <Text size="sm" color="text-low" weight="medium">
+          {rowData.length} {rowData.length === 1 ? "row" : "rows"}
+        </Text>
+      </Flex>
+      <table
+        className={`table table-bordered gbtable table-hover mb-0 ${styles.table}`}
+        style={{ fontSize: "var(--font-size-1)" }}
+      >
+        <thead
+          style={{
+            position: "sticky",
+            top: -1,
+            zIndex: 2,
+            backgroundColor: "var(--color-panel-solid)",
+          }}
+        >
+          {useTwoRowHeader && headerStructure ? (
+            <>
+              <tr>
+                {headerStructure.row1.map((cell, idx) => (
+                  <th
+                    key={idx}
+                    rowSpan={cell.rowSpan}
+                    colSpan={cell.colSpan ?? 1}
+                  >
+                    {cell.label}
+                  </th>
+                ))}
+              </tr>
+              <tr>
+                {headerStructure.row2Labels.map((label, idx) => (
+                  <th key={idx}>{label}</th>
+                ))}
+              </tr>
+            </>
+          ) : (
+            <tr>
+              {orderedColumnKeys.map((key, i) => (
+                <th key={key}>{columnLabels[i] ?? key}</th>
+              ))}
+            </tr>
+          )}
+        </thead>
+        <tbody>
+          {rowData.map((row, i) => (
+            <tr key={i}>
+              {orderedColumnKeys.map((key, j) => (
+                <td key={j}>
+                  {formatExplorationTableCell(row[key], columnFormats[key])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Box>
+  );
+}

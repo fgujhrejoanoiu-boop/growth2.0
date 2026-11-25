@@ -1,0 +1,347 @@
+import {
+  isSubUnitClusterMetric,
+  eligibleForUncappedMetric,
+  ExperimentMetricInterface,
+  getFactMetricPrimaryFactTableId,
+  isFactCompoundMetric,
+  isFactFunnelMetric,
+  isFactMetric,
+  isUpperPercentileCappedMetric,
+  isLowerPercentileCappedMetric,
+  isRatioMetric,
+  isRegressionAdjusted,
+  quantileMetricType,
+} from "shared/experiments";
+import type { ExperimentSnapshotSettings } from "shared/types/experiment-snapshot";
+import type {
+  FactMetricInterface,
+  FactTableInterface,
+  MetricQuantileSettings,
+} from "shared/types/fact-table";
+import type { FactMetricData } from "shared/types/integrations";
+import type { SqlDialect } from "shared/types/sql";
+import { getSnapshotCutoffDate } from "shared/util";
+
+import { getAggregationMetadata } from "back-end/src/integrations/sql/fact-metrics/aggregation-metadata";
+import { applyDailyParticipationTransformation } from "back-end/src/integrations/sql/processing/apply-daily-participation-transformation";
+import { capCoalesceValue } from "back-end/src/integrations/sql/primitives/cap-coalesce-value";
+import { getMaxHoursToConvert } from "back-end/src/integrations/sql/dates/max-hours-to-convert";
+import { getMetricEnd } from "back-end/src/integrations/sql/dates/metric-end";
+import { getMetricMinDelay } from "back-end/src/integrations/sql/dates/metric-min-delay";
+import { getMetricStart } from "back-end/src/integrations/sql/dates/metric-start";
+import { getRaMetricPhaseStartSettings } from "back-end/src/integrations/sql/dates/ra-metric-phase-start-settings";
+import {
+  compoundComponentColumn,
+  compoundCovariateComponentColumn,
+  compoundPassExpression,
+} from "back-end/src/integrations/sql/fact-metrics/compound-columns";
+
+export function getMetricRegressionAdjustmentData(
+  metric: FactMetricInterface,
+  regressionAdjustmentEnabled: boolean,
+): {
+  regressionAdjusted: boolean;
+  regressionAdjustmentHours: number;
+} {
+  const regressionAdjusted =
+    regressionAdjustmentEnabled && isRegressionAdjusted(metric);
+  const regressionAdjustmentHours = regressionAdjusted
+    ? (metric.regressionAdjustmentDays ?? 0) * 24
+    : 0;
+  return {
+    regressionAdjusted,
+    regressionAdjustmentHours,
+  };
+}
+
+export function getMetricData(
+  dialect: SqlDialect,
+  metricWithIndex: { metric: FactMetricInterface; index: number },
+  settings: Pick<
+    ExperimentSnapshotSettings,
+    | "attributionModel"
+    | "regressionAdjustmentEnabled"
+    | "startDate"
+    | "isClusterExperiment"
+    | "clusterSubUnitIdentifier"
+    | "clusterLevelMetricIds"
+    | "endDateIsCutoff"
+  > & { endDate?: Date },
+  activationMetric: ExperimentMetricInterface | null,
+  factTablesWithIndices: { factTable: FactTableInterface; index: number }[],
+  covariateTableAlias: string = "m",
+  alias: string,
+  /**
+   * Set when every source's per-user columns sit on one table, so value
+   * columns read from the bare `m` alias instead of the per-source `m{i}`.
+   */
+  flattenSources: boolean = false,
+): FactMetricData {
+  const { metric, index: metricIndex } = metricWithIndex;
+  const isClusterMetric = isSubUnitClusterMetric(metric, settings);
+  const isClusterRatioConversion =
+    isClusterMetric &&
+    ["mean", "proportion", "retention", "compound"].includes(metric.metricType);
+  const ratioMetric = isRatioMetric(metric);
+  const funnelMetric = isFactFunnelMetric(metric);
+  const quantileMetric = funnelMetric ? "" : quantileMetricType(metric);
+  const metricQuantileSettings: MetricQuantileSettings = (isFactMetric(
+    metric,
+  ) && !!quantileMetric
+    ? metric.quantileSettings
+    : undefined) ?? { type: "unit", quantile: 0, ignoreZeros: false };
+
+  const { regressionAdjusted, regressionAdjustmentHours } = funnelMetric
+    ? // TODO(funnel): CUPED for funnel metrics
+      { regressionAdjusted: false, regressionAdjustmentHours: 0 }
+    : getMetricRegressionAdjustmentData(
+        metric,
+        settings.regressionAdjustmentEnabled,
+      );
+
+  const overrideConversionWindows =
+    settings.attributionModel === "experimentDuration" ||
+    settings.attributionModel === "lookbackOverride";
+
+  const isUpperPercentileCapped = isUpperPercentileCappedMetric(metric);
+  const isLowerPercentileCapped = isLowerPercentileCappedMetric(metric);
+  const computeUncappedMetric = eligibleForUncappedMetric(metric);
+
+  const sourceIndexForFactTable = (factTableId: string | undefined): number =>
+    factTablesWithIndices.find((f) => f.factTable.id === factTableId)?.index ??
+    0;
+
+  const numeratorSourceIndex = sourceIndexForFactTable(
+    getFactMetricPrimaryFactTableId(metric),
+  );
+  const denominatorSourceIndex = sourceIndexForFactTable(
+    metric.denominator?.factTableId,
+  );
+  const funnelStepSourceIndices = isFactFunnelMetric(metric)
+    ? metric.funnelSettings.steps.map((step) =>
+        sourceIndexForFactTable(step.factTableId),
+      )
+    : [];
+  const compoundComponentSourceIndices = isFactCompoundMetric(metric)
+    ? metric.compoundSettings.components.map((component) =>
+        sourceIndexForFactTable(component.factTableId),
+      )
+    : [];
+  const numeratorAlias = `${numeratorSourceIndex === 0 ? "" : numeratorSourceIndex}`;
+  const denominatorAlias = `${denominatorSourceIndex === 0 ? "" : denominatorSourceIndex}`;
+  // Cap values stay per-source even when the value columns do not: each source
+  // gets its own __capValue CTE, cross joined under its own `cap{i}` alias.
+  const numeratorValueAlias = flattenSources ? "" : numeratorAlias;
+  const denominatorValueAlias = flattenSources ? "" : denominatorAlias;
+  const capCoalesceMetric = capCoalesceValue(dialect, {
+    valueCol: `m${numeratorValueAlias}.${alias}_value`,
+    metric,
+    capTablePrefix: `cap${numeratorAlias}`,
+    capValueCol: `${alias}_value_cap`,
+    lowerCapValueCol: `${alias}_value_cap_lower`,
+    columnRef: metric.numerator,
+  });
+  const capCoalesceDenominator = capCoalesceValue(dialect, {
+    valueCol: `m${denominatorValueAlias}.${alias}_denominator`,
+    metric,
+    capTablePrefix: `cap${denominatorAlias}`,
+    capValueCol: `${alias}_denominator_cap`,
+    lowerCapValueCol: `${alias}_denominator_cap_lower`,
+    columnRef: metric.denominator,
+  });
+  const capCoalesceCovariate = capCoalesceValue(dialect, {
+    valueCol: `${covariateTableAlias}${numeratorValueAlias}.${alias}_covariate_value`,
+    metric,
+    capTablePrefix: `cap${numeratorAlias}`,
+    capValueCol: `${alias}_value_cap`,
+    lowerCapValueCol: `${alias}_value_cap_lower`,
+    columnRef: metric.numerator,
+  });
+  const capCoalesceDenominatorCovariate = capCoalesceValue(dialect, {
+    valueCol: `${covariateTableAlias}${denominatorValueAlias}.${alias}_covariate_denominator`,
+    metric,
+    capTablePrefix: `cap${denominatorAlias}`,
+    capValueCol: `${alias}_denominator_cap`,
+    lowerCapValueCol: `${alias}_denominator_cap_lower`,
+    columnRef: metric.denominator,
+  });
+  // A compound metric's value is checking whether the unit passed every component, so it's a
+  // a test over per-component counts that may each sit on a different source.
+  // Therefore the `value` needs to repeat that `compoundPassExpression` for each source.
+  const valueAliasForSource = (sourceIndex: number) =>
+    flattenSources || sourceIndex === 0 ? "" : `${sourceIndex}`;
+  const compoundRefs = (
+    tableAlias: string,
+    column: typeof compoundComponentColumn,
+  ) =>
+    compoundComponentSourceIndices.map(
+      (sourceIndex, k) =>
+        `${tableAlias}${valueAliasForSource(sourceIndex)}.${column(alias, k)}`,
+    );
+  const compoundComponentRefs = compoundRefs("m", compoundComponentColumn);
+  const compoundValue = compoundComponentRefs.length
+    ? compoundPassExpression(dialect, compoundComponentRefs)
+    : null;
+  const compoundCovariate = compoundComponentRefs.length
+    ? compoundPassExpression(
+        dialect,
+        compoundRefs(covariateTableAlias, compoundCovariateComponentColumn),
+      )
+    : null;
+
+  const uncappedMetric = {
+    ...metric,
+    cappingSettings: {
+      type: "" as const,
+      value: 0,
+    },
+    lowerCappingSettings: null,
+  };
+  const uncappedCoalesceMetric = capCoalesceValue(dialect, {
+    valueCol: `m${numeratorValueAlias}.${alias}_value`,
+    metric: uncappedMetric,
+    capTablePrefix: `cap${numeratorAlias}`,
+    capValueCol: `${alias}_value_cap`,
+    lowerCapValueCol: `${alias}_value_cap_lower`,
+    columnRef: metric.numerator,
+  });
+  const uncappedCoalesceDenominator = capCoalesceValue(dialect, {
+    valueCol: `m${denominatorValueAlias}.${alias}_denominator`,
+    metric: uncappedMetric,
+    capTablePrefix: `cap${denominatorAlias}`,
+    capValueCol: `${alias}_denominator_cap`,
+    lowerCapValueCol: `${alias}_denominator_cap_lower`,
+    columnRef: metric.denominator,
+  });
+  const uncappedCoalesceCovariate = capCoalesceValue(dialect, {
+    valueCol: `${covariateTableAlias}${numeratorValueAlias}.${alias}_covariate_value`,
+    metric: uncappedMetric,
+    capTablePrefix: `cap${numeratorAlias}`,
+    capValueCol: `${alias}_value_cap`,
+    lowerCapValueCol: `${alias}_value_cap_lower`,
+    columnRef: metric.numerator,
+  });
+  const uncappedCoalesceDenominatorCovariate = capCoalesceValue(dialect, {
+    valueCol: `${covariateTableAlias}${denominatorValueAlias}.${alias}_covariate_denominator`,
+    metric: uncappedMetric,
+    capTablePrefix: `cap${denominatorAlias}`,
+    capValueCol: `${alias}_denominator_cap`,
+    lowerCapValueCol: `${alias}_denominator_cap_lower`,
+    columnRef: metric.denominator,
+  });
+
+  const orderedMetrics = (activationMetric ? [activationMetric] : []).concat([
+    metric,
+  ]);
+  const minMetricDelay = getMetricMinDelay(orderedMetrics);
+  const metricStart = getMetricStart(
+    settings.startDate,
+    minMetricDelay,
+    regressionAdjustmentHours,
+  );
+  const cutoffDate = getSnapshotCutoffDate(settings);
+  const metricEnd = getMetricEnd(
+    orderedMetrics,
+    settings.endDate,
+    overrideConversionWindows,
+    cutoffDate,
+  );
+
+  const raMetricPhaseStartSettings = getRaMetricPhaseStartSettings({
+    minDelay: minMetricDelay,
+    phaseStartDate: settings.startDate,
+    regressionAdjustmentHours,
+  });
+  const raMetricFirstExposureSettings = {
+    hours: regressionAdjustmentHours,
+    minDelay: minMetricDelay,
+    alias,
+  };
+
+  const maxHoursToConvert = getMaxHoursToConvert(
+    funnelMetric,
+    [metric],
+    activationMetric,
+  );
+
+  const numeratorAggFns = getAggregationMetadata(dialect, {
+    metric,
+    useDenominator: false,
+  });
+  const denominatorAggFns = getAggregationMetadata(dialect, {
+    metric,
+    useDenominator: true,
+  });
+
+  const covariateNumeratorAggFns = getAggregationMetadata(dialect, {
+    metric,
+    useDenominator: false,
+  });
+  const covariateDenominatorAggFns = getAggregationMetadata(dialect, {
+    metric,
+    useDenominator: true,
+  });
+
+  const aggregatedValueTransformation =
+    metric.metricType === "dailyParticipation"
+      ? ({
+          column,
+          initialTimestampColumn,
+          analysisEndDate,
+        }: {
+          column: string;
+          initialTimestampColumn: string;
+          analysisEndDate: Date;
+        }) =>
+          applyDailyParticipationTransformation(dialect, {
+            column,
+            initialTimestampColumn,
+            analysisEndDate,
+            metric,
+            overrideConversionWindows,
+            cutoffDate,
+          })
+      : ({ column }: { column: string }) => column;
+
+  return {
+    alias,
+    id: metric.id,
+    metric,
+    metricIndex,
+    ratioMetric,
+    isClusterRatioConversion,
+    funnelMetric,
+    quantileMetric,
+    metricQuantileSettings,
+    regressionAdjusted,
+    regressionAdjustmentHours,
+    overrideConversionWindows,
+    isUpperPercentileCapped,
+    isLowerPercentileCapped,
+    computeUncappedMetric,
+    numeratorSourceIndex,
+    denominatorSourceIndex,
+    funnelStepSourceIndices,
+    compoundComponentSourceIndices,
+    compoundComponentRefs,
+    capCoalesceMetric: compoundValue ?? capCoalesceMetric,
+    capCoalesceDenominator,
+    capCoalesceCovariate: compoundCovariate ?? capCoalesceCovariate,
+    capCoalesceDenominatorCovariate,
+    numeratorAggFns,
+    denominatorAggFns,
+    covariateNumeratorAggFns,
+    covariateDenominatorAggFns,
+    uncappedCoalesceMetric: compoundValue ?? uncappedCoalesceMetric,
+    uncappedCoalesceDenominator,
+    uncappedCoalesceCovariate: compoundCovariate ?? uncappedCoalesceCovariate,
+    uncappedCoalesceDenominatorCovariate,
+    minMetricDelay,
+    raMetricFirstExposureSettings,
+    raMetricPhaseStartSettings,
+    metricStart,
+    metricEnd,
+    maxHoursToConvert,
+    aggregatedValueTransformation,
+  };
+}

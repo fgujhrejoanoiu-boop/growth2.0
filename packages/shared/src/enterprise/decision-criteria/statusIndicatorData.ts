@@ -1,0 +1,299 @@
+import { ApiExperimentDecision } from "shared/validators";
+import {
+  ExperimentDataForStatusStringDates,
+  ExperimentHealthSettings,
+  DecisionCriteriaData,
+  ExperimentResultStatusData,
+  ExperimentDataForStatus,
+} from "shared/types/experiment";
+import { MetricGroupInterface } from "shared/types/metric-groups";
+import {
+  getContextualBanditResultStatus,
+  getExperimentResultStatus,
+} from "./decisionCriteria";
+
+export type MetricNameResolver = (metricId: string) => string;
+
+export type StatusIndicatorData = {
+  color: "amber" | "green" | "red" | "gold" | "indigo" | "gray" | "pink";
+  status: "Running" | "Stopped" | "Draft" | "Scheduled" | "Archived";
+  detailedStatus?: string;
+  needsAttention?: boolean;
+  // What a running status with a verdict asks for; a finer needsAttention.
+  decisionCategory?: ApiExperimentDecision["category"];
+  tooltip?: string;
+  // More actionable statuses sort first.
+  sortOrder: number;
+  // The verdict a running status was derived from.
+  resultStatus?: ExperimentResultStatusData;
+};
+
+export function getStatusIndicatorData({
+  experimentData,
+  skipArchived,
+  healthSettings,
+  decisionCriteria,
+  metricGroups,
+  resolveMetricName,
+}: {
+  experimentData: ExperimentDataForStatus | ExperimentDataForStatusStringDates;
+  skipArchived: boolean;
+  healthSettings: ExperimentHealthSettings;
+  decisionCriteria: DecisionCriteriaData;
+  metricGroups: MetricGroupInterface[];
+  // Errored metric ids are shown as-is when omitted.
+  resolveMetricName?: MetricNameResolver;
+}): StatusIndicatorData {
+  if (!skipArchived && experimentData.archived) {
+    return {
+      color: "gold",
+      status: "Archived",
+      sortOrder: 0,
+    };
+  }
+
+  if (experimentData.status === "draft") {
+    if (experimentData.nextScheduledStatusUpdate) {
+      return {
+        color: "indigo",
+        status: "Scheduled",
+        sortOrder: 7,
+      };
+    }
+    return {
+      color: "pink",
+      status: "Draft",
+      sortOrder: 6,
+    };
+  }
+
+  if (experimentData.status === "running") {
+    if (experimentData.type === "interleaving") {
+      return {
+        color: "indigo",
+        status: "Running",
+        sortOrder: 7,
+      };
+    }
+
+    if (experimentData.type === "contextual-bandit") {
+      const health = experimentData.analysisSummary?.health;
+      if (health) {
+        const cbResultStatus = getContextualBanditResultStatus({
+          srm: health.srm ?? null,
+          totalUsers: health.totalUsers ?? 0,
+          multipleExposures: health.multipleExposures ?? 0,
+          numOfVariations: experimentData.variations.length,
+          healthSettings,
+        });
+        if (cbResultStatus?.status === "unhealthy") {
+          return {
+            ...getDetailedRunningStatusIndicatorData(cbResultStatus),
+            resultStatus: cbResultStatus,
+          };
+        }
+      }
+      return {
+        color: "indigo",
+        status: "Running",
+        sortOrder: 7,
+      };
+    }
+
+    const runningStatusData = getExperimentResultStatus({
+      experimentData,
+      healthSettings,
+      decisionCriteria,
+      metricGroups,
+    });
+    if (runningStatusData) {
+      return {
+        ...getDetailedRunningStatusIndicatorData(
+          runningStatusData,
+          resolveMetricName,
+        ),
+        resultStatus: runningStatusData,
+      };
+    }
+
+    // 6. Otherwise, show running status
+    return {
+      color: "indigo",
+      status: "Running",
+      sortOrder: 7,
+    };
+  }
+
+  if (experimentData.status === "stopped") {
+    if (
+      experimentData.type === "contextual-bandit" ||
+      experimentData.type === "interleaving"
+    ) {
+      return {
+        color: "gray",
+        status: "Stopped",
+        sortOrder: 4,
+      };
+    }
+
+    switch (experimentData.results) {
+      case "won":
+        return {
+          color: "green",
+          status: "Stopped",
+          detailedStatus: "Won",
+          sortOrder: 4,
+        };
+      case "lost":
+        return {
+          color: "red",
+          status: "Stopped",
+          detailedStatus: "Lost",
+          sortOrder: 3,
+          tooltip: "There are no real losers in A/B testing, only learnings.",
+        };
+      case "inconclusive":
+        return {
+          color: "gray",
+          status: "Stopped",
+          detailedStatus: "Inconclusive",
+          sortOrder: 2,
+        };
+      case "dnf":
+        return {
+          color: "gray",
+          status: "Stopped",
+          detailedStatus: "Didn't finish",
+          sortOrder: 1,
+        };
+      case undefined:
+      default:
+        return {
+          color: "amber",
+          status: "Stopped",
+          detailedStatus: "Awaiting decision",
+          needsAttention: true,
+          sortOrder: 5,
+        };
+    }
+  }
+
+  // FIXME: How can we make this rely on the typechecker instead of throwing an error?
+  throw new Error(`Unknown experiment status`);
+}
+
+function getDetailedRunningStatusIndicatorData(
+  decisionData: ExperimentResultStatusData,
+  resolveMetricName?: MetricNameResolver,
+): StatusIndicatorData &
+  Required<Pick<StatusIndicatorData, "decisionCategory">> {
+  switch (decisionData.status) {
+    case "rollback-now":
+      return {
+        color: "amber",
+        status: "Running",
+        detailedStatus: "Roll back now",
+        tooltip: decisionData.tooltip,
+        needsAttention: true,
+        decisionCategory: "ready-for-action",
+        sortOrder: 13,
+      };
+    case "ship-now":
+      return {
+        color: "amber",
+        status: "Running",
+        detailedStatus: "Ship now",
+        tooltip: decisionData.tooltip,
+        needsAttention: true,
+        decisionCategory: "ready-for-action",
+        sortOrder: 12,
+      };
+    case "ready-for-review":
+      return {
+        color: "amber",
+        status: "Running",
+        detailedStatus: "Ready for review",
+        tooltip: decisionData.tooltip,
+        needsAttention: true,
+        decisionCategory: "ready-for-action",
+        sortOrder: 11,
+      };
+    case "scheduled-end-review":
+      return {
+        color: "amber",
+        status: "Running",
+        detailedStatus: "Ready for review",
+        tooltip: decisionData.tooltip,
+        needsAttention: true,
+        decisionCategory: "ready-for-action",
+        sortOrder: 10.5,
+      };
+    case "no-data":
+      return {
+        color: "amber",
+        status: "Running",
+        detailedStatus: "No data",
+        tooltip: decisionData.tooltip,
+        needsAttention: true,
+        decisionCategory: "has-issue",
+        sortOrder: 10,
+      };
+    case "data-incomplete": {
+      const erroredNames = decisionData.erroredMetrics.map(
+        (id) => resolveMetricName?.(id) ?? id,
+      );
+      const subject = erroredNames.length
+        ? erroredNames.join(", ")
+        : "Some metrics";
+      return {
+        color: "amber",
+        status: "Running",
+        detailedStatus: "Data incomplete",
+        tooltip: `${subject} could not be computed, so ship and review recommendations are paused. Roll back recommendations still apply.`,
+        needsAttention: true,
+        decisionCategory: "has-issue",
+        sortOrder: 9.5,
+      };
+    }
+    case "unhealthy":
+      return {
+        color: "amber",
+        status: "Running",
+        detailedStatus: "Unhealthy",
+        tooltip: decisionData.tooltip,
+        needsAttention: true,
+        decisionCategory: "has-issue",
+        sortOrder: 9,
+      };
+    case "days-left": {
+      const cappedPowerAdditionalDaysNeeded = Math.min(
+        decisionData.daysLeft,
+        90,
+      );
+
+      // Fewer days left = higher sortOrder
+      const sortOrderDecimal = 1 - cappedPowerAdditionalDaysNeeded / 90;
+
+      return {
+        color: "indigo",
+        status: "Running",
+        detailedStatus: `${
+          decisionData.daysLeft !== cappedPowerAdditionalDaysNeeded ? ">" : ""
+        }${cappedPowerAdditionalDaysNeeded} days left`,
+        tooltip: decisionData.tooltip
+          ? decisionData.tooltip
+          : `The experiment needs more data to reliably detect the target minimum detectable effect for all goal metrics. At recent traffic levels, the experiment will take ~${decisionData.daysLeft} more days to collect enough data.`,
+        decisionCategory: "collecting-data",
+        sortOrder: 8 + sortOrderDecimal,
+      };
+    }
+    case "before-min-duration":
+      return {
+        color: "indigo",
+        status: "Running",
+        tooltip: decisionData.tooltip,
+        decisionCategory: "collecting-data",
+        sortOrder: 7,
+      };
+  }
+}
